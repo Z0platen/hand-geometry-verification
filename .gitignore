@@ -1,0 +1,22 @@
+# Local biometric data and experiment files
+/data/
+/datasets/
+/captures/
+/recordings/
+/templates/
+/outputs/
+/tmp/
+
+# Python environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local configuration and downloaded models
+.env
+.env.*
+!.env.example
+*.task
+*.tflite
