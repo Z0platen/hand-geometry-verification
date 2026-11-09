@@ -1,39 +1,18 @@
 import argparse
-from itertools import pairwise
-from math import dist
+from math import isfinite
 from pathlib import Path
 from time import monotonic_ns
 
 import cv2
 import mediapipe as mp
 
+from geometry import FINGER_NAMES, analyze_hand
 
-MEASUREMENT_PATHS = (
-    ("Thumb", (2, 3, 4)),
-    ("Index", (5, 6, 7, 8)),
-    ("Middle", (9, 10, 11, 12)),
-    ("Ring", (13, 14, 15, 16)),
-    ("Pinky", (17, 18, 19, 20)),
-    ("Palm length", (0, 9)),
-)
 WINDOW_NAME = "Hand Geometry Pilot"
 DEFAULT_MODEL = Path(__file__).with_name("hand_landmarker.task")
 
 
-def measure_hand(points):
-    """Measure paths in pixels and divide them by the palm width proxy."""
-    palm_width = dist(points[5], points[17])
-    if palm_width < 1:
-        return []
-
-    measurements = []
-    for label, path in MEASUREMENT_PATHS:
-        length = sum(dist(points[start], points[end]) for start, end in pairwise(path))
-        measurements.append((label, length, length / palm_width))
-    return measurements
-
-
-def make_preview(frame, hands):
+def make_preview(frame, hands, *, title=WINDOW_NAME, measurements=None):
     height, width = frame.shape[:2]
     preview = cv2.copyMakeBorder(
         frame, 0, max(0, 240 - height), 0, 260, cv2.BORDER_CONSTANT, value=(30, 30, 30)
@@ -45,37 +24,41 @@ def make_preview(frame, hands):
             scale, (240, 240, 240), 1, cv2.LINE_AA,
         )
 
-    label("Hand Geometry Pilot", 12, 27, 0.58)
+    label(title, 12, 27, 0.58)
     label("Q / Esc to close", 12, 224)
-    if len(hands) != 1:
-        label("Show one open hand.", 12, 64)
+    if measurements is None:
+        measurements = analyze_hand(hands, width, height)
+    if measurements["status"] != "ok":
+        instructions = {
+            "no_hand": "Show one open hand.",
+            "multiple_hands": "Show only one hand.",
+            "finger_out_of_frame": "Keep all fingers in frame.",
+            "invalid_landmarks": "Hold your hand steady.",
+            "degenerate_palm": "Move your hand closer.",
+            "degenerate_finger": "Open your fingers.",
+        }
+        label(instructions[measurements["status"]], 12, 64)
         return preview
 
-    # x and y are normalized by different dimensions. Convert each axis to pixels.
     points = [(point.x * width, point.y * height) for point in hands[0]]
-    if not all(0 <= x < width and 0 <= y < height for x, y in points):
-        label("Keep the whole hand in frame.", 12, 64)
-        return preview
-
-    measurements = measure_hand(points)
-    if not measurements:
-        label("Move your hand closer.", 12, 64)
-        return preview
-
-    drawing_points = [(int(x), int(y)) for x, y in points]
+    drawing_points = {
+        index: (int(x), int(y)) for index, (x, y) in enumerate(points)
+        if isfinite(x) and isfinite(y) and 0 <= x < width and 0 <= y < height
+    }
     for edge in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS:
-        cv2.line(preview, drawing_points[edge.start], drawing_points[edge.end], (42, 200, 255), 2)
-    for point in drawing_points:
+        if edge.start in drawing_points and edge.end in drawing_points:
+            cv2.line(preview, drawing_points[edge.start], drawing_points[edge.end], (42, 200, 255), 2)
+    for point in drawing_points.values():
         cv2.circle(preview, point, 4, (70, 240, 125), -1, cv2.LINE_AA)
 
     label("Feature", 12, 58)
     label("Pixels", 122, 58)
     label("Ratio", 198, 58)
-    for row, (name, pixels, ratio) in enumerate(measurements):
+    for row, name in enumerate(FINGER_NAMES):
         y = 83 + row * 21
-        label(name, 12, y)
-        label(f"{pixels:.1f}", 122, y)
-        label(f"{ratio:.3f}", 198, y)
+        label(name.title(), 12, y)
+        label(f"{measurements[f'{name}_px']:.1f}", 122, y)
+        label(f"{measurements[f'{name}_ratio']:.3f}", 198, y)
 
     return preview
 
