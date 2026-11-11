@@ -48,13 +48,13 @@ class EnrollmentFlowTests(unittest.TestCase):
         self.session.add_sample.side_effect = save_sample
         model_path = Path("captures/demo/session/model.json")
         self.session.finalize.return_value = model_path
-        observations = [(self.measurements, [])] * 5
-        observations += [({"status": "no_hand"}, []), (self.measurements, [])]
+        observations = [(self.measurements, []), ({"status": "no_hand"}, [])] * 5
+        observations += [(self.measurements, [])]
         with patch("enroll.cv2.VideoCapture", return_value=self.camera), \
                 patch("enroll.EnrollmentSession", return_value=self.session), \
                 patch("enroll.cv2.namedWindow"), \
                 patch("enroll.cv2.imshow"), \
-                patch("enroll.cv2.waitKey", side_effect=[32] * 5 + [-1, ord("q")]), \
+                patch("enroll.cv2.waitKey", side_effect=[32, -1] * 5 + [ord("q")]), \
                 patch("enroll.cv2.getWindowProperty", return_value=1), \
                 patch("enroll.cv2.destroyAllWindows"), \
                 patch("enroll.analyze_frame", side_effect=observations), \
@@ -66,7 +66,7 @@ class EnrollmentFlowTests(unittest.TestCase):
         self.assertEqual(self.session.add_sample.call_count, 5)
         self.session.finalize.assert_called_once()
         verify_preview.assert_called_once()
-        self.assertEqual(self.camera.read.call_count, 7)
+        self.assertEqual(self.camera.read.call_count, 11)
         self.camera.release.assert_called_once()
 
     def test_camera_read_failure_releases_resources(self):
@@ -80,6 +80,20 @@ class EnrollmentFlowTests(unittest.TestCase):
         self.session.add_sample.assert_not_called()
         self.camera.release.assert_called_once()
         close_windows.assert_called_once()
+
+    def test_repeated_space_requires_hand_removal_before_another_capture(self):
+        self.session.add_sample.return_value = {"status": "saved", "count": 1, "target": 5}
+        with patch("enroll.cv2.VideoCapture", return_value=self.camera), \
+                patch("enroll.EnrollmentSession", return_value=self.session), \
+                patch("enroll.cv2.namedWindow"), patch("enroll.cv2.imshow"), \
+                patch("enroll.cv2.waitKey", side_effect=[32] * 5 + [ord("q")]), \
+                patch("enroll.cv2.getWindowProperty", return_value=1), \
+                patch("enroll.cv2.destroyAllWindows"), \
+                patch("enroll.analyze_frame", return_value=(self.measurements, [])), \
+                patch("enroll.enrollment_preview", return_value=self.frame):
+            run_enrollment(0, Mock(), "demo", Path("captures"), self.model, 5)
+        self.assertEqual(self.session.add_sample.call_count, 1)
+        self.session.finalize.assert_not_called()
 
 
 if __name__ == "__main__":

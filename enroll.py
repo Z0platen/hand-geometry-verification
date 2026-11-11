@@ -15,6 +15,7 @@ from verify import (
     DEFAULT_LANDMARKER,
     analyze_frame,
     decision_from_measurements,
+    snapshot_feedback,
     verification_preview,
 )
 
@@ -72,6 +73,8 @@ def run_enrollment(
         phase = "enrolling"
         feedback = "Show your right palm facing the camera and press SPACE when ready."
         personal_model = None
+        verification_feedback = None
+        awaiting_reposition = False
         last_timestamp = -1
         while True:
             ok, frame = camera.read()
@@ -80,11 +83,16 @@ def run_enrollment(
             now_ns = monotonic_ns()
             last_timestamp = max(last_timestamp + 1, now_ns // 1_000_000)
             measurements, hands = analyze_frame(frame, detector, last_timestamp)
+            if phase == "enrolling" and awaiting_reposition and measurements["status"] == "no_hand":
+                awaiting_reposition = False
+                feedback = "Show your right palm again, then press SPACE for the next sample."
 
+            decision = None
             if phase == "verifying":
                 decision = decision_from_measurements(measurements, user_id, personal_model)
                 preview = verification_preview(
                     frame, hands, decision, personal_model["method"], model=personal_model,
+                    feedback=verification_feedback,
                 )
             else:
                 preview = enrollment_preview(
@@ -94,14 +102,20 @@ def run_enrollment(
                     phase = "verifying"
             cv2.imshow(WINDOW_NAME, preview)
             key = cv2.waitKey(1) & 0xFF
-            if key in (27, ord("q")):
+            if key in (27, ord("q"), ord("Q")):
                 break
             if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                 break
+            if decision is not None and key in (ord("s"), ord("S")):
+                verification_feedback = snapshot_feedback(preview, decision, personal_model)
 
             if phase == "enrolling" and key == 32:
+                if awaiting_reposition:
+                    feedback = "Remove your hand from the frame, then show it again before saving."
+                    continue
                 update = session.add_sample(frame, measurements, now_ns / 1_000_000_000)
                 if update["status"] == "saved":
+                    awaiting_reposition = True
                     feedback = "Sample saved. Remove and reposition your hand before the next sample."
                     if update["count"] == update["target"]:
                         model_path = session.finalize()

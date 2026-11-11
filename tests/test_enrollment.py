@@ -38,7 +38,8 @@ class EnrollmentTests(unittest.TestCase):
     def test_manual_captures_save_pairs_and_median_model(self):
         session = EnrollmentSession("P01", self.root, reference(), sample_count=3)
         for index, value in enumerate((1, 99, 2)):
-            result = session.add_sample(self.frame, measurement(value), index * 1.0)
+            frame = np.full_like(self.frame, 80 + index * 20)
+            result = session.add_sample(frame, measurement(value), index * 1.0)
             self.assertEqual(result, {"status": "saved", "count": index + 1, "target": 3})
             capture = session.session_dir / f"sample_{index + 1:03d}"
             image = cv2.imread(str(capture / "hand.jpg"))
@@ -78,16 +79,99 @@ class EnrollmentTests(unittest.TestCase):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 EnrollmentSession("P02", self.root, {**reference(), **changes})
 
+    def test_malformed_reference_is_rejected_before_creating_session(self):
+        invalid_changes = (
+            {"schema_version": True},
+            {"templates": {}},
+            {"templates": {"dataset_user": [True] * 5}},
+            {"templates": {"dataset_user": ["1"] * 5}},
+            {"templates": {"dataset_user": [[1]] * 5}},
+            {"threshold": 10 ** 1000},
+        )
+        for changes in invalid_changes:
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                EnrollmentSession("invalid", self.root, {**reference(), **changes})
+        self.assertFalse((self.root / "invalid").exists())
+
     def test_failed_metadata_write_preserves_previous_samples(self):
         session = EnrollmentSession("P01", self.root, reference(), sample_count=2)
         session.add_sample(self.frame, measurement(), 0)
+        second_frame = np.full_like(self.frame, 120)
         with patch("enrollment.write_json", side_effect=OSError("disk unavailable")):
             with self.assertRaises(OSError):
-                session.add_sample(self.frame, measurement(2), 1)
+                session.add_sample(second_frame, measurement(2), 1)
         self.assertEqual(session.count, 1)
         self.assertTrue((session.session_dir / "sample_001" / "hand.jpg").exists())
         self.assertFalse((session.session_dir / "sample_002").exists())
-        self.assertEqual(session.add_sample(self.frame, measurement(2), 1)["status"], "saved")
+        self.assertEqual(session.add_sample(second_frame, measurement(2), 1)["status"], "saved")
+
+    def test_identical_jpeg_does_not_count_as_another_capture(self):
+        session = EnrollmentSession("P01", self.root, reference(), sample_count=2)
+        session.add_sample(self.frame, measurement(), 0)
+        duplicate = session.add_sample(self.frame.copy(), measurement(9), 1)
+        self.assertEqual(duplicate, {"status": "duplicate_capture", "count": 1, "target": 2})
+        self.assertFalse((session.session_dir / "sample_002").exists())
+        changed_frame = np.full_like(self.frame, 120)
+        self.assertEqual(session.add_sample(changed_frame, measurement(2), 1)["status"], "saved")
+        self.assertEqual(load_model(session.finalize())["templates"], {"P01": [1.5] * 5})
+
+    def test_failed_final_json_write_cleans_partial_file_and_can_retry(self):
+        session = EnrollmentSession("P01", self.root, reference(), sample_count=1)
+        session.add_sample(self.frame, measurement(), 0)
+        saved_capture = session.session_dir / "sample_001" / "hand.jpg"
+        saved_hash = hashlib.sha256(saved_capture.read_bytes()).hexdigest()
+
+        def partial_write(path, contents):
+            path.write_text('{"partial":', encoding="utf-8")
+            raise OSError("disk full")
+
+        with patch("enrollment.write_json", side_effect=partial_write):
+            with self.assertRaisesRegex(OSError, "disk full"):
+                session.finalize()
+        self.assertFalse((session.session_dir / "model.json").exists())
+        self.assertEqual(list(session.session_dir.glob(".model-*.json")), [])
+        self.assertEqual(session.count, 1)
+        self.assertEqual(hashlib.sha256(saved_capture.read_bytes()).hexdigest(), saved_hash)
+        self.assertEqual(load_model(session.finalize())["templates"], {"P01": [1.0] * 5})
+
+    def test_final_publication_failure_cleans_temporary_model_and_can_retry(self):
+        session = EnrollmentSession("P01", self.root, reference(), sample_count=1)
+        session.add_sample(self.frame, measurement(), 0)
+        with patch("enrollment.os.link", side_effect=OSError("publication unavailable")):
+            with self.assertRaisesRegex(OSError, "publication unavailable"):
+                session.finalize()
+        self.assertFalse((session.session_dir / "model.json").exists())
+        self.assertEqual(list(session.session_dir.glob(".model-*.json")), [])
+        self.assertTrue(session.finalize().is_file())
+
+    def test_finalize_preserves_an_existing_model(self):
+        session = EnrollmentSession("P01", self.root, reference(), sample_count=1)
+        session.add_sample(self.frame, measurement(), 0)
+        existing = session.session_dir / "model.json"
+        previous = b'previous model bytes'
+        existing.write_bytes(previous)
+        with self.assertRaises(FileExistsError):
+            session.finalize()
+        self.assertEqual(existing.read_bytes(), previous)
+        self.assertEqual(list(session.session_dir.glob(".model-*.json")), [])
+        self.assertTrue((session.session_dir / "sample_001" / "hand.jpg").is_file())
+
+    def test_cleanup_failure_after_publication_keeps_finalized_model_for_retry(self):
+        session = EnrollmentSession("P01", self.root, reference(), sample_count=1)
+        session.add_sample(self.frame, measurement(), 0)
+        original_unlink = Path.unlink
+
+        def blocked_cleanup(path, *args, **kwargs):
+            if path.name.startswith(".model-"):
+                raise OSError("cleanup unavailable")
+            return original_unlink(path, *args, **kwargs)
+
+        with patch("enrollment.Path.unlink", blocked_cleanup):
+            with self.assertRaisesRegex(OSError, "cleanup unavailable"):
+                session.finalize()
+        published = session.session_dir / "model.json"
+        self.assertEqual(load_model(published)["templates"], {"P01": [1.0] * 5})
+        self.assertEqual(session.finalize(), published)
 
     def test_reference_file_provenance_and_capture_limit(self):
         path = self.root / "reference.json"

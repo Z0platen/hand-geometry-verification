@@ -20,11 +20,18 @@ PROTOCOL = (
     "capture-session labels. Nearby video frames may remain correlated. Results "
     "do not establish cross-session or webcam generalization."
 )
+ACQUISITION_STATUSES = {
+    "ok", "no_hand", "multiple_hands", "invalid_landmarks", "finger_out_of_frame",
+    "degenerate_palm", "degenerate_finger", "missing_image", "unreadable_image",
+}
 
 
 def read_features(path):
     with Path(path).open(encoding="utf-8-sig", newline="") as handle:
         reader = csv.DictReader(handle)
+        headers = reader.fieldnames or []
+        if len(headers) != len(set(headers)) or any(not name for name in headers):
+            raise ValueError("Feature CSV column names must be nonempty and unique.")
         required = {"image_name", "subject_id", "status", *sum(FEATURE_SETS.values(), [])}
         missing = required - set(reader.fieldnames or [])
         if missing:
@@ -35,11 +42,15 @@ def read_features(path):
         seen_images = set()
         seen_hashes = set()
         for line, row in enumerate(reader, 2):
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"Incorrect number of fields on CSV line {line}.")
             name = (row["image_name"] or "").strip()
             subject = (row["subject_id"] or "").strip()
             status = (row["status"] or "").strip()
             if not name or not subject or not status:
                 raise ValueError(f"Missing image, subject, or status on CSV line {line}.")
+            if status not in ACQUISITION_STATUSES:
+                raise ValueError(f"Unknown acquisition status on CSV line {line}: {status!r}.")
             if name in seen_images:
                 raise ValueError(f"Duplicate image name {name!r}; each image must appear once.")
             seen_images.add(name)
@@ -52,7 +63,7 @@ def read_features(path):
             subject_counts[subject] += 1
             if status != "ok":
                 continue
-            row["image_name"], row["subject_id"] = name, subject
+            row["image_name"], row["subject_id"], row["status"] = name, subject, status
             for columns in FEATURE_SETS.values():
                 try:
                     feature_vector(row, columns)
@@ -63,7 +74,7 @@ def read_features(path):
 
 
 def split_samples(rows, seed=42, min_samples=6):
-    if min_samples < 4:
+    if isinstance(min_samples, bool) or not isinstance(min_samples, int) or min_samples < 4:
         raise ValueError("At least four samples are required for two enrollment and separate validation/test images.")
     grouped = defaultdict(list)
     for row in rows:
@@ -96,11 +107,19 @@ def comparisons(rows, templates, columns):
     return distances, genuine, subjects
 
 
-def error_curve(distances, genuine):
-    scores = np.asarray(distances, dtype=float).ravel()
-    labels = np.asarray(genuine, dtype=bool).ravel()
-    if not scores.size or not np.all(np.isfinite(scores)) or not labels.any() or labels.all():
+def comparison_arrays(distances, genuine):
+    scores = np.asarray(distances, dtype=float)
+    labels = np.asarray(genuine)
+    if scores.shape != labels.shape or labels.dtype != np.dtype(bool):
+        raise ValueError("Each distance requires a corresponding Boolean genuine/impostor label.")
+    scores, labels = scores.ravel(), labels.ravel()
+    if not scores.size or not np.all(np.isfinite(scores)) or np.any(scores < 0) or not labels.any() or labels.all():
         raise ValueError("Error curves require finite genuine and impostor distances.")
+    return scores, labels
+
+
+def error_curve(distances, genuine):
+    scores, labels = comparison_arrays(distances, genuine)
     order = np.argsort(scores, kind="stable")
     sorted_scores, sorted_labels = scores[order], labels[order]
     ends = np.r_[np.flatnonzero(np.diff(sorted_scores)), len(scores) - 1]
@@ -120,6 +139,9 @@ def calibrate_threshold(distances, genuine):
 
 
 def summarize_scores(distances, genuine, threshold):
+    distances, genuine = comparison_arrays(distances, genuine)
+    if isinstance(threshold, bool) or not isinstance(threshold, (int, float)) or not np.isfinite(threshold):
+        raise ValueError("The operating threshold must be a finite number.")
     accepted = distances <= threshold
     genuine_count = int(np.sum(genuine))
     impostor_count = int(np.sum(~genuine))

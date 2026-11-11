@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import shutil
 import tempfile
 from time import perf_counter
 from zipfile import BadZipFile, ZipFile
@@ -23,23 +24,31 @@ COLUMNS = ("image_name", "subject_id", "image_sha256", "status", "palm_width_px"
 
 
 def read_metadata(path):
+    path = Path(path)
     with path.open(encoding="utf-8-sig", newline="") as file:
         reader = csv.DictReader(file)
         required = {"id", "imageName", "aspectOfHand"}
+        headers = reader.fieldnames or []
+        if len(headers) != len(set(headers)) or any(not name for name in headers):
+            raise ValueError("Metadata column names must be nonempty and unique.")
         if not required.issubset(reader.fieldnames or []):
             raise ValueError("Metadata requires id, imageName, and aspectOfHand columns.")
         selected = []
         seen = set()
-        for row in reader:
+        for line, row in enumerate(reader, 2):
+            if None in row or any(value is None for value in row.values()):
+                raise ValueError(f"Metadata has an incorrect number of fields on CSV line {line}.")
             if not all(isinstance(row.get(name), str) and row[name].strip() for name in required):
                 raise ValueError("Metadata has a row with missing id, imageName, or aspectOfHand.")
-            if row["aspectOfHand"].strip().lower() != "palmar right":
-                continue
             image_name, subject_id = row["imageName"].strip(), row["id"].strip()
             if not image_name or not subject_id or image_name in seen:
-                raise ValueError("Right-palmar metadata has an empty identifier or duplicate filename.")
-            selected.append((image_name, subject_id))
+                raise ValueError("Metadata has an empty identifier or duplicate filename.")
             seen.add(image_name)
+            aspect = row["aspectOfHand"].strip().lower()
+            if aspect not in {"palmar right", "palmar left", "dorsal right", "dorsal left"}:
+                raise ValueError(f"Unknown hand aspect on CSV line {line}: {aspect!r}.")
+            if aspect == "palmar right":
+                selected.append((image_name, subject_id))
     if not selected:
         raise ValueError("Metadata contains no right-palmar images.")
     return sorted(selected)
@@ -63,7 +72,10 @@ def extract_record(archive, index, image_name, subject_id, detector):
         return {**record, "status": "missing_image"}
     encoded = archive.read(index[image_name])
     record["image_sha256"] = hashlib.sha256(encoded).hexdigest()
-    frame = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR)
+    try:
+        frame = cv2.imdecode(np.frombuffer(encoded, dtype=np.uint8), cv2.IMREAD_COLOR) if encoded else None
+    except cv2.error:
+        frame = None
     if frame is None:
         return {**record, "status": "unreadable_image"}
     height, width = frame.shape[:2]
@@ -72,15 +84,38 @@ def extract_record(archive, index, image_name, subject_id, detector):
     return {**record, **analyze_hand(result.hand_landmarks, width, height)}
 
 
+def publish_outputs(staged_files):
+    """Replace the CSV and provenance together, restoring prior files on failure."""
+    backups = {}
+    for staged, target in staged_files:
+        if target.exists():
+            backup = staged.with_name(staged.name + ".previous")
+            shutil.copy2(target, backup)
+            backups[target] = backup
+    published = []
+    try:
+        for staged, target in staged_files:
+            os.replace(staged, target)
+            published.append(target)
+    except OSError:
+        for target in reversed(published):
+            if target in backups:
+                os.replace(backups[target], target)
+            else:
+                target.unlink(missing_ok=True)
+        raise
+
+
 def extract(archive_path, metadata_path, model_path, output_path, limit=None):
-    output_path = output_path.resolve()
-    metadata_output = output_path.with_suffix(".meta.json")
+    archive_path, metadata_path, model_path = map(Path, (archive_path, metadata_path, model_path))
+    output_path = Path(output_path).resolve()
+    metadata_output = output_path.with_suffix(".meta.json").resolve()
     sources = {path.resolve() for path in (archive_path, metadata_path, model_path)}
-    if output_path in sources or metadata_output in sources:
+    if output_path in sources or metadata_output in sources or output_path == metadata_output:
         raise ValueError("Output files must have different paths from the input files.")
     selected = read_metadata(metadata_path)
     if limit is not None:
-        if limit < 1:
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit < 1:
             raise ValueError("The image limit must be positive.")
         selected = selected[:limit]
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,14 +126,13 @@ def extract(archive_path, metadata_path, model_path, output_path, limit=None):
     )
     counts = Counter()
     started = perf_counter()
-    temporary_path = None
-    try:
+    with tempfile.TemporaryDirectory(prefix=f".{output_path.name}-build-", dir=output_path.parent) as folder:
+        build = Path(folder)
+        temporary_path = build / "features.csv"
         with ZipFile(archive_path) as archive:
             index = archive_index(archive)
             with mp.tasks.vision.HandLandmarker.create_from_options(options) as detector:
-                with tempfile.NamedTemporaryFile("w", encoding="utf-8", newline="", dir=output_path.parent,
-                                                 suffix=".tmp", delete=False) as file:
-                    temporary_path = Path(file.name)
+                with temporary_path.open("w", encoding="utf-8", newline="") as file:
                     writer = csv.DictWriter(file, fieldnames=COLUMNS)
                     writer.writeheader()
                     for number, (image_name, subject_id) in enumerate(selected, 1):
@@ -107,21 +141,25 @@ def extract(archive_path, metadata_path, model_path, output_path, limit=None):
                         counts[record["status"]] += 1
                         if number % 100 == 0:
                             print(f"Processed {number}/{len(selected)} images", flush=True)
-        os.replace(temporary_path, output_path)
-    finally:
-        if temporary_path is not None and temporary_path.exists():
-            temporary_path.unlink()
+                    file.flush()
+                    os.fsync(file.fileno())
 
-    summary = {
-        "dataset": "11K Hands", "view": "palmar right", "selected_images": len(selected),
-        "statuses": dict(sorted(counts.items())), "feature_columns": list(RATIO_COLUMNS),
-        "mediapipe_version": mp.__version__, "opencv_version": cv2.__version__,
-        "model_sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
-        "metadata_sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
-        "features_sha256": hashlib.sha256(output_path.read_bytes()).hexdigest(),
-        "elapsed_seconds": round(perf_counter() - started, 2),
-    }
-    metadata_output.write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        summary = {
+            "dataset": "11K Hands", "view": "palmar right", "selected_images": len(selected),
+            "statuses": dict(sorted(counts.items())), "feature_columns": list(RATIO_COLUMNS),
+            "mediapipe_version": mp.__version__, "opencv_version": cv2.__version__,
+            "model_sha256": hashlib.sha256(model_path.read_bytes()).hexdigest(),
+            "metadata_sha256": hashlib.sha256(metadata_path.read_bytes()).hexdigest(),
+            "features_sha256": hashlib.sha256(temporary_path.read_bytes()).hexdigest(),
+            "elapsed_seconds": round(perf_counter() - started, 2),
+        }
+        staged_metadata = build / "features.meta.json"
+        with staged_metadata.open("w", encoding="utf-8") as file:
+            json.dump(summary, file, indent=2, allow_nan=False)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        publish_outputs(((temporary_path, output_path), (staged_metadata, metadata_output)))
     return summary
 
 

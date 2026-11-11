@@ -14,7 +14,7 @@ import threading
 import cv2
 import numpy as np
 
-from matching import FEATURE_SETS, feature_vector
+from matching import FEATURE_SETS, feature_vector, validate_model
 
 
 def validate_user_id(user_id):
@@ -51,13 +51,10 @@ class EnrollmentSession:
             raise ValueError("The minimum capture interval must be finite and non-negative.") from error
         if not isfinite(interval) or interval < 0:
             raise ValueError("The minimum capture interval must be finite and non-negative.")
-        if not isinstance(reference_model, dict) or reference_model.get("schema_version") != 1:
-            raise ValueError("A valid version 1 ratio reference model is required.")
+        validate_model(reference_model)
         if reference_model.get("method") != "ratios" or reference_model.get("feature_names") != FEATURE_SETS["ratios"]:
             raise ValueError("Personal enrollment requires the five-finger ratio reference model.")
         threshold = reference_model.get("threshold")
-        if isinstance(threshold, bool) or not isinstance(threshold, (float, int)) or not isfinite(threshold):
-            raise ValueError("The reference threshold must be finite.")
 
         try:
             encoded_reference = json.dumps(reference_model, sort_keys=True, allow_nan=False).encode("utf-8")
@@ -77,6 +74,7 @@ class EnrollmentSession:
         self.min_interval_seconds = interval
         self._threshold = float(threshold)
         self._samples = []
+        self._sample_hashes = set()
         self._last_timestamp = None
         self._finalized_model = None
         self._lock = threading.Lock()
@@ -144,6 +142,9 @@ class EnrollmentSession:
             if not success:
                 raise RuntimeError("Could not encode the camera capture.")
             image_bytes = encoded.tobytes()
+            image_hash = hashlib.sha256(image_bytes).hexdigest()
+            if image_hash in self._sample_hashes:
+                return self._result("duplicate_capture")
             capture_index = self.count + 1
             capture_name = f"sample_{capture_index:03d}"
             metadata = {
@@ -153,7 +154,7 @@ class EnrollmentSession:
                 "captured_at_utc": utc_now(),
                 "timestamp_seconds": float(timestamp),
                 "image_file": "hand.jpg",
-                "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
+                "image_sha256": image_hash,
                 "image_width": int(frame.shape[1]),
                 "image_height": int(frame.shape[0]),
                 "measurements": dict(zip(FEATURE_SETS["ratios"], vector.tolist(), strict=True)),
@@ -167,6 +168,7 @@ class EnrollmentSession:
                 write_json(staging / "metadata.json", metadata)
                 staging.rename(self.session_dir / capture_name)
             self._samples.append(vector)
+            self._sample_hashes.add(image_hash)
             self._last_timestamp = float(timestamp)
             return self._result("saved")
 
@@ -198,10 +200,12 @@ class EnrollmentSession:
             }
             model_path = self.session_dir / "model.json"
             temporary_path = self.session_dir / f".model-{secrets.token_hex(4)}.json"
-            write_json(temporary_path, model)
             try:
-                temporary_path.rename(model_path)
+                write_json(temporary_path, model)
+                # Publishing a hard link is atomic and refuses an existing target
+                # on both Windows and POSIX. rename() can replace it on POSIX.
+                os.link(temporary_path, model_path)
+                self._finalized_model = model_path
             finally:
                 temporary_path.unlink(missing_ok=True)
-            self._finalized_model = model_path
             return model_path

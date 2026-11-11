@@ -11,12 +11,24 @@ The previous version displayed hand landmarks and measurements. This version add
 - **Visible verification results:** show the claimed identity, comparison distance, threshold, and ACCEPT / REJECT decision for photographs or live camera frames.
 - **Personal enrollment:** save 10 manually captured webcam samples, create a local profile, then remove and show the hand again for live comparison.
 - **Experiment reports:** export split manifests, comparison scores, models, FMR/FNMR statistics, and result plots.
-- **Validation:** 30 automated tests cover measurements, extraction, matching, enrollment, file-write failures, and camera cleanup. Personal photographs and templates remain in Git-ignored local directories.
+- **Validation:** automated tests cover measurements, extraction, matching, enrollment, file-write failures, and camera cleanup. Personal photographs and templates remain in Git-ignored local directories.
 
 This is a working research prototype. The dataset results below show substantial errors, and personal webcam verification currently uses a transferred dataset threshold. Webcam-specific calibration and independent accuracy testing remain future work.
 
+## Reliability improvements
+
+- Enrollment waits for the hand to leave the frame between successful captures, so holding Space cannot fill the profile with repeated samples. Exact duplicate JPEG captures are also rejected.
+- Interrupted model writes are cleaned up, and publishing a profile preserves an existing model file.
+- Model loading rejects malformed values and non-finite numbers. Distance calculations handle extreme finite values without silently converting a nonzero distance to zero.
+- Invalid dataset headers, rows, and score labels fail clearly. Extraction stages its feature CSV and provenance metadata before publication.
+- `verify.py --user musa --camera 0` opens the latest completed personal session without copying a model path. Incomplete sessions are skipped; a corrupt selected profile reports an error.
+- Empty photographs report a clear decoding error. Both uppercase and lowercase Q close the application.
+
+These changes address correctness and usability. The image-split results below remain the initial baseline; improved biometric accuracy has not been established.
+
 ## Current implementation
 
+- `app.py` provides a desktop menu for profile selection, enrollment, verification, and manual experiments.
 - `pilot.py` displays live landmarks, five finger lengths in pixels, and ratios to a palm-width proxy.
 - `geometry.py` defines the shared measurements and acquisition-quality checks.
 - `extract_features.py` reads the 11K Hands ZIP and metadata and writes right-palmar measurements and failure statuses to CSV.
@@ -25,6 +37,9 @@ This is a working research prototype. The dataset results below show substantial
 - `verify.py` applies an exported model to a photograph or a live camera stream.
 - `enroll.py` collects personal webcam samples and switches to live comparison with the new profile.
 - `enrollment.py` stores local capture sessions and builds personal median templates.
+- `experiment.py` collects manually triggered webcam comparison attempts with a declared actual subject.
+- `trial_log.py` stores those attempts and exports CSV records and summary metrics.
+- `snapshots.py` saves a verification screenshot with the decision and model fingerprint.
 
 OpenCV handles capture and drawing. The pretrained MediaPipe Hand Landmarker supplies 21 points. Feature calculations, quality rules, enrollment, comparison, calibration, and evaluation are implemented in this repository.
 
@@ -37,6 +52,46 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 curl.exe --fail --location --output hand_landmarker.task https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task
 ```
+
+## Desktop menu
+
+Double-click **start.cmd**, or run it from the repository folder:
+
+```cmd
+start.cmd
+```
+
+The menu lists completed personal profiles and shows the sample count for the latest session. Choose a **Selected profile**, then use **Verify with webcam** or **Verify a photo** to compare a hand against it. To create a profile, fill in **New user ID** and click **Enroll new user**. Choose a camera index if needed. Close the active window with **Q** or **Esc** before starting another action. Use **Refresh** to reload the profile list.
+
+For **Run experiment**, fill in **Actual person ID** with the ID of the person showing their hand. When testing your own profile, click **Use selected profile ID** to copy that ID into the field. For a different volunteer, type their ID. Enter a **Condition** such as `day1-normal` or `day2-far`. The panel identifies which field needs attention if a required ID is missing or invalid.
+
+The Python environment and model setup above are required. Personal enrollment also requires the generated dataset ratio model described below. The menu launches the same scripts and preserves their experimental limitations.
+
+## Save a screenshot and decision
+
+In photograph or live verification, press **S** to save the displayed result. Each request creates a new directory under `outputs/snapshots/` containing `preview.png` and `decision.json`. The JSON records the matching decision, method, timestamp, image hash, and model fingerprint. Enrollment templates are not included. The same shortcut is available after enrollment switches to verification.
+
+Screenshots are local biometric records and remain Git-ignored. One saved result illustrates a comparison; it is not an accuracy estimate.
+
+## Collect webcam test attempts
+
+After creating a personal profile, use the menu's experiment action or run:
+
+```cmd
+.venv\Scripts\python.exe experiment.py --user musa --actual musa --condition day1-normal --camera 0
+```
+
+`--user` selects the claimed identity's latest completed profile. `--actual` declares who is presenting the hand: use the same ID for a genuine attempt, or a different volunteer's ID for an impostor attempt. For example:
+
+```cmd
+.venv\Scripts\python.exe experiment.py --user musa --actual volunteer1 --condition day1-normal --camera 0
+```
+
+Press **Space** once per attempt. Camera frames are not automatically counted. After a valid acquisition, remove the hand before making another attempt. Attempts are separated by at least one second. An unsuccessful acquisition is recorded separately with no acceptance decision. **Q / Esc** closes the window and exports the results.
+
+Each run is stored under `outputs/experiments/` with per-attempt records, `trials.csv`, and `summary.json`. Reports identify the frozen model and threshold, declared subjects, capture condition, valid genuine/impostor counts, acquisition failures, FMR, and FNMR. A rate without any eligible comparisons is `null`, shown as n/a. These logs store decisions rather than photographs. A local `model.json` snapshot preserves the model fingerprint; it contains enrollment templates and stays Git-ignored with the rest of the run.
+
+The actual subject is declared by the operator; it is not inferred by the system. Manually separated attempts can still be correlated. Collect multiple volunteers and different days or capture conditions, and keep calibration captures separate from the final test. This mode measures the fixed model and does not tune its threshold.
 
 ## Webcam measurement pilot
 
@@ -58,11 +113,17 @@ After generating `outputs/evaluation/model_ratios.json` with the dataset workflo
 .venv\Scripts\python.exe enroll.py --user musa
 ```
 
-Use a short user ID containing letters, numbers, underscores, or hyphens. The enrollment window opens the camera. Show one open right palm with all fingertips in the frame, then press **Space** to save a sample. Collect **10** usable samples, slightly relaxing and repositioning the hand between captures while keeping the palm facing the camera. The counter increases only when a sample is saved, with at least 0.8 seconds between captures.
+Use a short user ID containing letters, numbers, underscores, or hyphens. The enrollment window opens the camera. Show one open right palm with all fingertips in the frame, then press **Space** to save a sample. Collect **10** usable samples. After each successful capture, remove the hand from the frame, then show the palm again before pressing Space. The counter increases only when a sample is saved, with at least 0.8 seconds between captures. Repeated identical JPEG captures do not increase the count.
 
 After the final sample, the application saves the profile and switches to live verification with that same user ID. Remove your hand and show it again to try the comparison. **Q** or **Esc** closes the window. `--camera 1` selects another camera. Images are saved only when you press Space during enrollment.
 
-Each run creates a separate directory under `captures/USER_ID/`, containing the captured photographs, measurements, and `model.json`. The terminal prints the model path. To reuse a saved profile later:
+Each run creates a separate directory under `captures/USER_ID/`, containing the captured photographs, measurements, and `model.json`. The terminal prints the model path. To reuse the latest completed profile later:
+
+```cmd
+.venv\Scripts\python.exe verify.py --user musa --camera 0
+```
+
+The default capture root is next to the script. Use `--captures "C:\path\to\captures"` with `--user` for another root. To choose a specific session:
 
 ```cmd
 .venv\Scripts\python.exe verify.py --model "captures\musa\SESSION\model.json" --claim musa --camera 0

@@ -90,7 +90,7 @@ def run_preview(camera_index, model_path):
                 cv2.imshow(WINDOW_NAME, make_preview(frame, result.hand_landmarks))
 
                 key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q")) or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
+                if key in (27, ord("q"), ord("Q")) or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
                     break
         finally:
             camera.release()
