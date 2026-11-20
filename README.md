@@ -6,7 +6,7 @@ A Biometrics course project at Sapienza University of Rome. The application veri
 
 The desktop application uses one enrollment and one verification workflow. Each of 10 manually captured images supplies both finger-to-palm ratios and an aligned palmprint descriptor. The verification screen displays a single combined ACCEPT / REJECT result.
 
-The repository includes `configs/palm_reference.json`, containing the trained palm projection, operating thresholds, normalization scales, descriptor settings, and experiment provenance. Personal templates are created locally during enrollment. After installing the Python packages and downloading `hand_landmarker.task`, the interactive combined workflow can start directly from the code checkout.
+The repository includes `configs/palm_reference.json`, containing the current trained palm projection, operating thresholds, normalization scales, descriptor settings, and experiment provenance. It uses a 64-dimensional LDA projection with shrinkage 0.1 and a 95% palm / 5% geometry weighted average of the normalized component distances. Personal templates are created locally during enrollment. Existing personal profiles keep the reference and thresholds they were created with; use `--reenroll` to create a fresh 10-image session against the current reference. After installing the Python packages and downloading `hand_landmarker.task`, the interactive combined workflow can start directly from the code checkout.
 
 Use `start.cmd` for the desktop menu, or use CMD:
 
@@ -38,11 +38,11 @@ Full results are generated under `outputs/palm_evaluation/`. To reproduce the ca
 .venv\Scripts\python.exe prepare_palm.py --archive "C:\path\to\Hands.zip" --metadata "C:\path\to\HandInfo.csv" --output outputs\palm_evaluation
 ```
 
-## Trained palm recognition
+## Trained palm recognition: historical incumbent
 
-The default reference now includes a supervised regularized Linear Discriminant Analysis projection. It learns 64 dimensions from the 384 raw palm features, using only the 1,015 enrollment images from 174 identities. The within-class covariance uses fixed shrinkage 0.1. Projection fitting uses the enrollment partition, while threshold selection and normalization use the separate 739-image calibration partition.
+The first trained reference included a supervised regularized Linear Discriminant Analysis projection. It learned 64 dimensions from the 384 raw palm features, using only the 1,015 enrollment images from 174 identities. The within-class covariance used fixed shrinkage 0.1. Projection fitting used the enrollment partition, while threshold selection and normalization used the separate 739-image calibration partition.
 
-Fusion tests the preregistered palm weights 0.25, 0.5, and 0.75 on calibration images. The selected weight is 0.75 for palm and 0.25 for hand geometry. Both components contribute to the single application verdict. The resulting frozen model is evaluated on the 962 held-out images.
+The historical fusion experiment tested palm weights 0.25, 0.5, and 0.75 on calibration images. It selected a 75% palm and 25% geometry weighted average of normalized component distances. Both components contribute to the single application verdict. This frozen incumbent was evaluated on the 962 held-out images.
 
 | Method | Test FMR | Test FNMR |
 | --- | --- | --- |
@@ -53,7 +53,7 @@ Fusion tests the preregistered palm weights 0.25, 0.5, and 0.75 on calibration i
 
 ![Training comparison on held-out images](docs/palm_trained_comparison.png)
 
-Training and inference use the same raw descriptor and projected-distance calculation. Cached raw personal descriptors remain compatible. The reference used when creating a profile freezes that profile's metric and thresholds. The evaluated identities also appear in enrollment, so independent volunteers and capture sessions are needed to assess webcam generalization.
+Training and inference use the same raw descriptor and projected-distance calculation. Cached raw personal descriptors remain compatible. The reference used when creating a profile freezes that profile's metric and thresholds. The evaluated identities also appear in enrollment, so these image-split measurements do not establish independent identity or webcam generalization.
 
 After preparing the dataset features, reproduce training with:
 
@@ -61,7 +61,35 @@ After preparing the dataset features, reproduce training with:
 .venv\Scripts\python.exe train_palm.py
 ```
 
-The output directory `outputs/palm_trained/` contains the full model, aggregate reference, comparison plot, and summary. The public aggregate reference contains learned weights and calibration information. Personal templates remain in local capture sessions.
+The output directory `outputs/palm_trained/` contains the full incumbent model, aggregate reference, comparison plot, and summary. The public aggregate reference contains learned weights and calibration information. Personal templates remain in local capture sessions.
+
+## Bounded palm fusion optimization
+
+A bounded calibration-only sweep compared 60 configurations with the fixed incumbent: shrinkage values 0.01, 0.1, and 0.5; dimensions 16, 32, 64, 96, and 128; and palm weights 0.5, 0.75, 0.9, and 0.95. It selected `a0.1_d64_w0.95`: the projection stayed at 64 dimensions and shrinkage 0.1, while the palm weight changed to 95% (geometry 5%) in the average of normalized distances. Thus, the measured change is in calibration-selected fusion, not evidence of a better LDA embedding. The incumbent wins when rounded calibration fusion balanced error and then false-match rate do not strictly improve.
+
+Calibration fusion balanced error decreased from 3.92% to 1.36%. The model's parameters, normalization, and thresholds were frozen before evaluation on the historical test split. That split contains enrolled identities and 962 probes; it is exploratory and not a fresh untouched holdout.
+
+| Evaluation | Method | False accepts / impostor comparisons (FMR) | False rejects / genuine probes (FNMR) |
+| --- | --- | ---: | ---: |
+| Historical 962-probe split | Incumbent fusion | 3,273 / 166,426 (1.97%) | 60 / 962 (6.24%) |
+| Historical 962-probe split | Tuned fusion | 1,320 / 166,426 (0.79%) | 21 / 962 (2.18%) |
+| Historical 962-probe split | Palm only, unchanged | 1,129 / 166,426 (0.68%) | 24 / 962 (2.49%) |
+| 13 identities outside training | Incumbent fusion | 18 / 408 (4.41%) | 6 / 34 (17.65%) |
+| 13 identities outside training | Tuned fusion | 9 / 408 (2.21%) | 7 / 34 (20.59%) |
+| 13 identities outside training | Palm only, unchanged | 7 / 408 (1.72%) | 6 / 34 (17.65%) |
+
+On the historical split, tuned fusion reduced both reported error counts. The separate diagnostic's 13 eligible identities came from `insufficient_samples` manifest rows and are absent from the training cohort. Each identity has two common-valid enrollment photographs; the remaining common-valid images form 34 probes. Its error rates are conditional on both geometry and palm acquisition succeeding. Tuned fusion reduced false accepts but had one more false reject than the incumbent. Capture sessions are unknown, and the small probe count makes these estimates uncertain. Neither evaluation establishes webcam or cross-session performance, and the change is not a claim of generally better biometric accuracy.
+
+![Incumbent and calibration-selected palm fusion comparison](docs/palm_tuned_comparison.png)
+
+Reproduce the sweep and the identity-disjoint diagnostic with the saved hash-bound features and splits:
+
+```cmd
+.venv\Scripts\python.exe optimize_palm.py
+.venv\Scripts\python.exe evaluate_palm_transfer.py
+```
+
+The optimizer writes the selected model, sanitized public reference, search table, summary, and comparison chart under `outputs/palm_tuned/`. The transfer evaluator uses a separate identity-disjoint split for a frozen diagnostic; it does not select or activate a model.
 
 Live capture requests 1280 × 720 pixels by default, and the preview shows the actual input dimensions returned by the camera. `--camera-width` and `--camera-height` can request another supported mode. If the palm crop is too small, the preview guides the user to move closer while keeping the full hand visible. Personal registration stores reference samples for a user of the trained recognizer.
 
@@ -109,7 +137,7 @@ This is a working research prototype. The dataset results below show substantial
 - `verify.py --user musa --camera 0` opens the latest completed personal session without copying a model path. Incomplete sessions are skipped; a corrupt selected profile reports an error.
 - Empty photographs report a clear decoding error. Both uppercase and lowercase Q close the application.
 
-These changes address correctness and usability. The image-split results below remain the initial baseline; improved biometric accuracy has not been established.
+These changes address correctness and usability. Dataset scores are exploratory enrolled-user image-split measurements; they do not establish webcam or cross-session performance.
 
 ## Current implementation
 
@@ -118,6 +146,10 @@ These changes address correctness and usability. The image-split results below r
 - `palmprint.py` extracts aligned palm texture, and `multimodal.py` scores the combined model.
 - `prepare_palm.py` calibrates and evaluates the three research baselines on matched data splits.
 - `palm_trials.py` records measured-distance trials, and `palm_robustness.py` evaluates resolution changes at frozen thresholds.
+- `optimize_palm.py` searches bounded LDA and palm-fusion settings using calibration-only model selection.
+- `evaluate_palm_transfer.py` evaluates frozen models on an identity-disjoint diagnostic split.
+- `palm_learning.py` fits and applies the regularized LDA palm projection.
+- `train_palm.py` produces the fixed incumbent model and calibration report used by the bounded sweep.
 - `pilot.py` displays live landmarks, five finger lengths in pixels, and ratios to a palm-width proxy.
 - `geometry.py` defines the shared measurements and acquisition-quality checks.
 - `extract_features.py` reads the 11K Hands ZIP and metadata and writes right-palmar measurements and failure statuses to CSV.

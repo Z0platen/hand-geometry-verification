@@ -16,32 +16,26 @@
   "thresholds": {
     "geometry": 0.14532825178722064,
     "palm": 1.15469753517947,
-    "fusion": 1.9036369184770128
+    "fusion": 2.0209248088313867
   },
   "fusion": {
-    "geometry_scale": 0.09186129924414631,
+    "geometry_scale": 0.09186129924415035,
     "palm_scale": 0.5776274519566073,
+    "weights": {
+      "geometry": 0.050000000000000044,
+      "palm": 0.95
+    },
     "normalization_source": "Calibration genuine-distance medians with fixed scale 1 if the median is zero.",
     "calibration_details": {
       "geometry": {
-        "genuine_median": 0.09186129924414631,
+        "genuine_median": 0.09186129924415035,
         "fallback_used": false
       },
       "palm": {
         "genuine_median": 0.5776274519566073,
         "fallback_used": false
       }
-    },
-    "weights": {
-      "geometry": 0.25,
-      "palm": 0.75
-    },
-    "weight_selection": "Minimum calibration balanced error, then lower FMR, then closest to equal weights, then lower palm weight.",
-    "candidate_palm_weights": [
-      0.25,
-      0.5,
-      0.75
-    ]
+    }
   },
   "calibration": {
     "users": 174,
@@ -49,7 +43,7 @@
     "seed": 42,
     "selection": "Minimum calibration balanced error; ties prefer lower FMR, then lower threshold."
   },
-  "evaluation_protocol": "Regularized LDA uses enrollment labels and palm descriptors only. Templates are the same raw enrollment medians as the handcrafted baseline. Fusion scales, fusion weight selection and operating thresholds use calibration only. The test split evaluates the frozen models. This is an enrolled-user image split with unknown capture sessions and potentially correlated frames and comparison pairs. Cross-session and webcam performance remain unverified.",
+  "evaluation_protocol": "Regularized LDA settings and fusion weights were selected using calibration rows only. Metric fitting uses enrollment descriptors only; raw enrollment median templates are preserved. Thresholds and normalization scales are frozen before the historical exploratory test split is scored. That enrolled-user image split has unknown capture sessions and potentially correlated frames and pairs; it is not a fresh untouched holdout, and cross-session or webcam performance remains unverified.",
   "dataset": "11K Hands",
   "view": "palmar right",
   "limited_run": false,
@@ -25803,7 +25797,32 @@
     "training_split": "enrollment",
     "numpy_version": "2.5.4"
   },
-  "training_protocol": "Regularized LDA uses enrollment labels and palm descriptors only. Templates are the same raw enrollment medians as the handcrafted baseline. Fusion scales, fusion weight selection and operating thresholds use calibration only. The test split evaluates the frozen models.",
   "baseline_model_sha256": "557e26dc9e469cae0c9838b866cee9ae467172cb4c3d0d529fd6806cffeb051b",
+  "optimization": {
+    "selection_phase": "calibration",
+    "candidate": "a0.1_d64_w0.95",
+    "incumbent_model_sha256": "e9226a4ad14417d8cc4905f1da209e23e250ff27d3e4d2bec31bbd792996475c",
+    "bounded_grid": {
+      "shrinkages": [
+        0.01,
+        0.1,
+        0.5
+      ],
+      "dimensions": [
+        16,
+        32,
+        64,
+        96,
+        128
+      ],
+      "palm_weights": [
+        0.5,
+        0.75,
+        0.9,
+        0.95
+      ]
+    },
+    "calibration_strictly_improved": true
+  },
   "reference_kind": "palm_geometry_calibration"
 }

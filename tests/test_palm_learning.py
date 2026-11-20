@@ -7,7 +7,7 @@ import unittest
 
 import numpy as np
 
-from palm_learning import fit_metric, project_features, validate_metric
+from palm_learning import MAX_COMPONENTS, SHRINKAGE, fit_metric, project_features, validate_metric
 from palmprint import PALM_FEATURE_SIZE
 from prepare_palm import evaluate_records
 from train_palm import PALM_WEIGHTS, train
@@ -65,6 +65,39 @@ class PalmMetricTests(unittest.TestCase):
             project_features(unit, {**metric, "mean": unit})
         with self.assertRaisesRegex(ValueError, "unit length"):
             project_features([0] * PALM_FEATURE_SIZE, metric)
+
+    def test_explicit_default_settings_match_the_default_metric(self):
+        rows = records()
+        features = [row["palm"] for row in rows]
+        labels = [row["subject_id"] for row in rows]
+        self.assertEqual(fit_metric(features, labels),
+                         fit_metric(features, labels, max_components=MAX_COMPONENTS, shrinkage=SHRINKAGE))
+
+    def test_tuned_metric_round_trips_above_default_component_limit(self):
+        subjects = MAX_COMPONENTS + 2
+        features = np.eye(PALM_FEATURE_SIZE)[:subjects]
+        labels = [str(subject) for subject in range(subjects)]
+        metric = fit_metric(features, labels, max_components=PALM_FEATURE_SIZE, shrinkage=1)
+        restored = validate_metric(json.loads(json.dumps(metric)))
+        self.assertEqual(restored["output_size"], subjects - 1)
+        self.assertEqual(restored["shrinkage"], 1.0)
+        projected = project_features(features, restored)
+        self.assertEqual(projected.shape, (subjects, subjects - 1))
+        np.testing.assert_allclose(np.linalg.norm(projected, axis=1), 1)
+
+    def test_tuning_rejects_invalid_settings(self):
+        features = [descriptor(0, 0), descriptor(1, 0)]
+        labels = ["a", "b"]
+        metric = fit_metric(features, labels)
+        for limit in (0, -1, PALM_FEATURE_SIZE + 1, 1.5, "2", True):
+            with self.subTest(max_components=limit), self.assertRaisesRegex(ValueError, "max_components"):
+                fit_metric(features, labels, max_components=limit)
+        for shrinkage in (0, -0.1, 1.1, float("nan"), float("inf"), "0.1", True):
+            with self.subTest(shrinkage=shrinkage):
+                with self.assertRaisesRegex(ValueError, "shrinkage"):
+                    fit_metric(features, labels, shrinkage=shrinkage)
+                with self.assertRaisesRegex(ValueError, "training settings"):
+                    validate_metric({**metric, "shrinkage": shrinkage})
 
     def test_test_split_mutation_cannot_change_training_or_calibration(self):
         with tempfile.TemporaryDirectory() as directory:

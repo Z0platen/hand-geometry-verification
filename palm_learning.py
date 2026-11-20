@@ -1,5 +1,7 @@
 """Supervised regularized LDA for the raw Gabor palm descriptor."""
 
+from numbers import Integral, Real
+
 import numpy as np
 
 from palmprint import PALM_FEATURE_SIZE
@@ -46,8 +48,8 @@ def _metric_arrays(metric):
     if (type(input_size) is not int or input_size != PALM_FEATURE_SIZE
             or type(sample_count) is not int or type(class_count) is not int
             or not 2 <= class_count <= sample_count
-            or type(output_size) is not int or not 1 <= output_size <= min(MAX_COMPONENTS, class_count - 1)
-            or type(shrinkage) is not float or shrinkage != SHRINKAGE):
+            or type(output_size) is not int or not 1 <= output_size <= min(input_size, class_count - 1)
+            or type(shrinkage) not in (int, float) or not 0 < shrinkage <= 1):
         raise ValueError("Invalid dimensions or training settings for the learned palm metric.")
     mean = _finite_array(metric.get("mean"), "Palm metric mean")
     projection = _finite_array(metric.get("projection"), "Palm metric projection")
@@ -64,8 +66,16 @@ def validate_metric(metric):
     return metric
 
 
-def fit_metric(features, labels):
-    """Fit a shared low-dimensional projection using labeled enrollment samples."""
+def fit_metric(features, labels, *, max_components=MAX_COMPONENTS, shrinkage=SHRINKAGE):
+    """Fit a regularized projection with up to max_components discriminative axes."""
+    if (isinstance(max_components, bool) or not isinstance(max_components, Integral)
+            or not 1 <= max_components <= PALM_FEATURE_SIZE):
+        raise ValueError(f"max_components must be an integer between 1 and {PALM_FEATURE_SIZE}.")
+    if (isinstance(shrinkage, bool) or not isinstance(shrinkage, Real)
+            or not 0 < shrinkage <= 1 or float(shrinkage) == 0):
+        raise ValueError("shrinkage must be a finite number greater than 0 and at most 1.")
+    shrinkage = float(shrinkage)
+
     samples = _raw_descriptors(features)
     labels = list(labels)
     if samples.ndim != 2 or len(labels) != len(samples):
@@ -91,14 +101,16 @@ def fit_metric(features, labels):
     if scale <= 0:
         raise ValueError("Training descriptors have no variation across identities.")
 
-    regularized = (1 - SHRINKAGE) * within + SHRINKAGE * scale * np.eye(PALM_FEATURE_SIZE)
+    regularized = (1 - shrinkage) * within + shrinkage * scale * np.eye(PALM_FEATURE_SIZE)
     eigenvalues, eigenvectors = np.linalg.eigh(regularized)
+    if eigenvalues[0] <= 0:
+        raise ValueError("shrinkage is too small for a numerically stable palm metric.")
     whitener = eigenvectors / np.sqrt(eigenvalues)
     scatter = whitener.T @ between @ whitener
     values, vectors = np.linalg.eigh((scatter + scatter.T) / 2)
     order = np.argsort(values)[::-1]
     significant = order[values[order] > max(0.0, values[-1]) * PALM_FEATURE_SIZE * np.finfo(float).eps]
-    components = significant[:min(MAX_COMPONENTS, len(classes) - 1)]
+    components = significant[:min(max_components, len(classes) - 1)]
     if not components.size:
         raise ValueError("Training descriptors have no discriminative directions.")
 
@@ -114,7 +126,7 @@ def fit_metric(features, labels):
         "projection": projection.tolist(),
         "training_samples": len(samples),
         "training_classes": len(classes),
-        "shrinkage": SHRINKAGE,
+        "shrinkage": shrinkage,
     })
 
 
