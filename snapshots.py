@@ -27,7 +27,7 @@ def save_snapshot(preview, decision, model, root=DEFAULT_SNAPSHOTS):
         "image_file": "preview.png",
         "image_sha256": hashlib.sha256(image_bytes).hexdigest(),
         "decision": decision,
-        "method": model["method"],
+        "method": model.get("method", model.get("model_kind", "unknown")),
         "model_kind": model.get("model_kind", "dataset_experiment"),
         "model_sha256": hashlib.sha256(
             json.dumps(model, sort_keys=True, allow_nan=False).encode("utf-8")

@@ -1,8 +1,9 @@
-"""A small desktop launcher for local hand geometry demonstrations."""
+"""Desktop launcher for combined hand verification."""
 
 from dataclasses import dataclass
 from datetime import datetime
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -45,9 +46,10 @@ def condition_label(value):
 @dataclass(frozen=True)
 class Profile:
     user_id: str
-    model_path: Path
+    model_path: Path | None
     sample_count: int | None
     session_count: int
+    palm_model_path: Path | None = None
 
 
 def list_profiles(captures_root):
@@ -67,9 +69,13 @@ def list_profiles(captures_root):
             path for path in user_directory.glob("*/model.json")
             if path.is_file() and path.resolve().is_relative_to(captures_root)
         ]
-        if not models:
+        palm_models = [path for path in user_directory.glob("*/palm_model.json")
+                       if path.is_file() and path.resolve().is_relative_to(captures_root)]
+        if not models and not palm_models:
             continue
-        latest = max(models, key=lambda path: path.parent.name)
+        latest_geometry = max(models, key=lambda path: path.parent.name) if models else None
+        latest_palm = max(palm_models, key=lambda path: path.parent.name) if palm_models else None
+        latest = latest_palm or latest_geometry
         sample_count = None
         try:
             model = json.loads(latest.read_text(encoding="utf-8"))
@@ -77,35 +83,51 @@ def list_profiles(captures_root):
             if type(count) is int and count > 0:
                 sample_count = count
         except (OSError, UnicodeError, ValueError, AttributeError):
-            # Keep the same latest-session selection as verify.py. Its loader
-            # reports malformed models rather than silently selecting an older one.
             pass
-        profiles.append(Profile(user_id, latest, sample_count, len(models)))
+        session_count = len({path.parent for path in models + palm_models})
+        profiles.append(Profile(user_id, latest_geometry, sample_count, session_count, latest_palm))
     return profiles
 
 
 def build_command(
     action, user_id, *, camera="0", image_path=None, actual_id="",
-    condition="standard", root=ROOT, executable=None,
+    condition="standard", root=ROOT, executable=None, distance_cm="", scale="1.0",
 ):
     """Construct separate arguments; user-entered values never become shell code."""
-    user_id = validate_profile_id(user_id, "New user ID" if action == "enroll" else "Selected profile ID")
+    if action not in ("enroll", "live", "photo", "experiment"):
+        raise ValueError(f"Unknown action: {action!r}.")
     root = Path(root).resolve()
     executable = str(Path(executable or sys.executable).resolve())
-    if action == "enroll":
-        return [executable, str(root / "enroll.py"), f"--user={user_id}", "--camera", str(camera_index(camera))]
-    if action == "live":
-        return [executable, str(root / "verify.py"), f"--user={user_id}", "--camera", str(camera_index(camera))]
+    user_id = validate_profile_id(user_id, "New user ID" if action == "enroll" else "Selected profile ID")
+    command = [executable, str(root / "palm_demo.py"), f"--user={user_id}"]
     if action == "photo":
         if image_path is None or not Path(image_path).is_file():
             raise ValueError("Select an existing image file.")
-        return [executable, str(root / "verify.py"), f"--user={user_id}",
-                "--image", str(Path(image_path).resolve()), "--show"]
-    if action == "experiment":
-        return [executable, str(root / "experiment.py"), f"--user={user_id}",
-                f"--actual={validate_profile_id(actual_id, 'Actual person ID')}", f"--condition={condition_label(condition)}",
-                "--camera", str(camera_index(camera))]
-    raise ValueError(f"Unknown action: {action!r}.")
+        return command + ["--image", str(Path(image_path).resolve()), "--show"]
+
+    command.extend(["--camera", str(camera_index(camera))])
+    if action == "enroll":
+        return command + ["--reenroll"]
+    if action == "live":
+        return command
+
+    actual_id = validate_profile_id(actual_id, "Actual person ID")
+    try:
+        factor = float(scale)
+    except (ValueError, TypeError) as error:
+        raise ValueError("Input scale must be between 0.1 and 1.0.") from error
+    if isinstance(scale, bool) or not math.isfinite(factor) or not 0.1 <= factor <= 1:
+        raise ValueError("Input scale must be between 0.1 and 1.0.")
+    command.extend([f"--actual={actual_id}", f"--condition={condition_label(condition)}", f"--scale={factor:g}"])
+    if distance_cm is not None and str(distance_cm).strip():
+        try:
+            distance = float(distance_cm)
+        except (ValueError, TypeError) as error:
+            raise ValueError("Measured distance must be a positive number in centimeters.") from error
+        if isinstance(distance_cm, bool) or not math.isfinite(distance) or distance <= 0:
+            raise ValueError("Measured distance must be a positive number in centimeters.")
+        command.append(f"--distance-cm={distance:g}")
+    return command
 
 
 @dataclass(frozen=True)
@@ -118,7 +140,9 @@ class RunResult:
 
 def process_error_detail(text):
     lines = text.splitlines()
-    prefixes = ("Verification error:", "Enrollment error:", "Experiment error:")
+    prefixes = (
+        "Verification error:", "Enrollment error:", "Experiment error:", "Palm study error:", "Dataset demo error:",
+    )
     for line in reversed(lines):
         if line.startswith(prefixes):
             return line
@@ -187,81 +211,88 @@ class Launcher:
         self.runner = ChildRunner()
         self.profiles = {}
         self.busy_controls = []
+        self.profile_pickers = []
         self.selected = tk.StringVar()
         self.new_user = tk.StringVar()
-        self.camera = tk.StringVar(value="0")
         self.actual = tk.StringVar()
         self.condition = tk.StringVar(value="standard")
+        self.distance = tk.StringVar()
+        self.scale = tk.StringVar(value="1.0")
+        self.camera = tk.StringVar(value="0")
         self.summary = tk.StringVar()
-        self.status = tk.StringVar(value="Ready. Choose an enrolled profile or create a new one.")
-        window.title("Hand Geometry - Project Menu")
-        window.minsize(690, 610)
-        window.geometry("790x660")
+        self.status = tk.StringVar(value="Ready.")
+        self.pending_enrollment = None
+        window.title("Hand Verification")
+        window.minsize(540, 460)
+        window.geometry("680x490")
         window.protocol("WM_DELETE_WINDOW", self.close)
+
         body = ttk.Frame(window, padding=24)
         body.pack(fill="both", expand=True)
-        body.columnconfigure(0, weight=1)
-        ttk.Label(body, text="Hand Geometry Verification", font=("Segoe UI", 20, "bold")).grid(sticky="w")
-        ttk.Label(body, text="Enroll a hand, compare a photo, or run a labeled experiment.").grid(sticky="w", pady=(5, 18))
+        ttk.Label(body, text="Hand Verification", font=("Segoe UI", 20, "bold")).pack(anchor="w")
+        ttk.Label(body, text="Combines hand shape and palm texture in one check.").pack(anchor="w", pady=(4, 16))
+        self.tabs = ttk.Notebook(body)
+        self.tabs.pack(fill="both", expand=True)
+        self.verify_tab = self.add_tab("Verify")
+        self.enroll_tab = self.add_tab("Enroll")
+        experiment = self.add_tab("Experiments")
 
-        profiles = ttk.LabelFrame(body, text="Local profiles", padding=14)
-        profiles.grid(sticky="ew")
-        profiles.columnconfigure(1, weight=1)
-        ttk.Label(profiles, text="Selected profile").grid(row=0, column=0, sticky="w", padx=(0, 12))
-        self.profile_picker = ttk.Combobox(profiles, textvariable=self.selected, state="readonly")
-        self.profile_picker.grid(row=0, column=1, sticky="ew")
-        self.profile_picker.bind("<<ComboboxSelected>>", lambda _event: self.update_summary())
-        refresh = ttk.Button(profiles, text="Refresh", command=self.refresh)
-        refresh.grid(row=0, column=2, padx=(10, 0))
-        self.busy_controls.append(refresh)
-        ttk.Label(profiles, textvariable=self.summary, wraplength=650).grid(row=1, column=0, columnspan=3, sticky="w", pady=(10, 0))
+        self.add_profile_picker(self.verify_tab)
+        ttk.Label(self.verify_tab, textvariable=self.summary, wraplength=450).grid(
+            row=1, column=0, columnspan=2, sticky="w", pady=(10, 0),
+        )
+        actions = ttk.Frame(self.verify_tab)
+        actions.grid(row=2, column=0, columnspan=2, sticky="w", pady=(16, 0))
+        self.add_button(actions, "Start camera", self.live).pack(side="left", padx=(0, 10))
+        self.add_button(actions, "Choose photo", self.photo).pack(side="left")
 
-        create = ttk.Frame(body)
-        create.grid(sticky="ew", pady=(16, 8))
-        ttk.Label(create, text="New user ID").pack(side="left", padx=(0, 12))
-        new_entry = ttk.Entry(create, textvariable=self.new_user, width=22)
-        new_entry.pack(side="left", padx=(0, 12))
-        enroll = ttk.Button(create, text="Enroll new user", command=self.enroll)
-        enroll.pack(side="left")
-        self.busy_controls.extend([new_entry, enroll])
-        ttk.Label(body, text="Enrollment saves 10 manually requested hand photos locally.").grid(sticky="w", pady=(0, 14))
+        self.add_entry(self.enroll_tab, "New user ID", self.new_user, row=0)
+        ttk.Label(
+            self.enroll_tab, text="Register your own hand with 10 reference photos. The recognition model is already trained on 11K Hands.",
+            wraplength=450,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(10, 0))
+        self.add_button(self.enroll_tab, "Enroll hand", self.enroll).grid(
+            row=2, column=0, columnspan=2, sticky="w", pady=(16, 0),
+        )
 
-        camera_row = ttk.Frame(body)
-        camera_row.grid(sticky="ew", pady=(0, 14))
-        ttk.Label(camera_row, text="Camera index").pack(side="left", padx=(0, 12))
-        camera_entry = ttk.Entry(camera_row, textvariable=self.camera, width=6)
-        camera_entry.pack(side="left")
-        ttk.Label(camera_row, text="Usually 0; try 1 for another camera.").pack(side="left", padx=12)
-        self.busy_controls.append(camera_entry)
+        self.add_profile_picker(experiment)
+        self.add_entry(experiment, "Actual person ID", self.actual, row=1)
+        self.add_entry(experiment, "Condition", self.condition, row=2)
+        self.add_entry(experiment, "Measured distance (cm, optional)", self.distance, row=3)
+        self.add_entry(experiment, "Digital input scale", self.scale, row=4)
+        self.add_entry(experiment, "Camera index", self.camera, row=5)
+        self.add_button(experiment, "Run experiment", self.experiment).grid(
+            row=6, column=1, sticky="w", pady=(14, 0),
+        )
 
-        actions = ttk.Frame(body)
-        actions.grid(sticky="ew", pady=(0, 18))
-        for label, callback in (("Verify with webcam", self.live), ("Verify a photo", self.photo)):
-            button = ttk.Button(actions, text=label, command=callback)
-            button.pack(side="left", padx=(0, 12))
-            self.busy_controls.append(button)
-
-        experiment = ttk.LabelFrame(body, text="Manual experiment", padding=14)
-        experiment.grid(sticky="ew")
-        experiment.columnconfigure(1, weight=1)
-        ttk.Label(experiment, text="Actual person ID").grid(row=0, column=0, sticky="w", padx=(0, 12))
-        actual_entry = ttk.Entry(experiment, textvariable=self.actual)
-        actual_entry.grid(row=0, column=1, sticky="ew")
-        ttk.Label(experiment, text="Condition").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        condition_entry = ttk.Entry(experiment, textvariable=self.condition)
-        condition_entry.grid(row=1, column=1, sticky="ew", pady=(10, 0))
-        experiment_button = ttk.Button(experiment, text="Run experiment", command=self.experiment)
-        experiment_button.grid(row=0, column=2, rowspan=2, padx=(14, 0))
-        ttk.Label(experiment, text="Enter the ID of the person showing their hand. For your own test, use the selected profile's ID.", wraplength=610).grid(row=2, column=0, columnspan=3, sticky="w", pady=(10, 0))
-        use_selected = ttk.Button(experiment, text="Use selected profile ID", command=self.use_selected_actual)
-        use_selected.grid(row=3, column=1, sticky="w", pady=(8, 0))
-        self.busy_controls.extend([actual_entry, condition_entry, experiment_button, use_selected])
-
-        ttk.Label(body, text="Research demo: dataset threshold; webcam accuracy is not calibrated.", wraplength=700).grid(sticky="w", pady=(18, 10))
-        ttk.Separator(body).grid(sticky="ew")
-        ttk.Label(body, textvariable=self.status, wraplength=700).grid(sticky="w", pady=(12, 0))
+        ttk.Label(body, textvariable=self.status, wraplength=450).pack(anchor="w", pady=(12, 0))
         self.refresh()
         window.after(250, self.poll)
+
+    def add_tab(self, title):
+        tab = ttk.Frame(self.tabs, padding=16)
+        tab.columnconfigure(1, weight=1)
+        self.tabs.add(tab, text=title)
+        return tab
+
+    def add_profile_picker(self, tab):
+        ttk.Label(tab, text="Profile").grid(row=0, column=0, sticky="w", padx=(0, 12))
+        picker = ttk.Combobox(tab, textvariable=self.selected, state="readonly")
+        picker.grid(row=0, column=1, sticky="ew")
+        picker.bind("<<ComboboxSelected>>", lambda _event: self.update_summary())
+        self.profile_pickers.append(picker)
+
+    def add_entry(self, tab, label, variable, *, row):
+        spacing = (8, 0) if row else 0
+        ttk.Label(tab, text=label).grid(row=row, column=0, sticky="w", padx=(0, 12), pady=spacing)
+        entry = ttk.Entry(tab, textvariable=variable)
+        entry.grid(row=row, column=1, sticky="ew", pady=spacing)
+        self.busy_controls.append(entry)
+
+    def add_button(self, parent, label, callback):
+        button = ttk.Button(parent, text=label, command=callback)
+        self.busy_controls.append(button)
+        return button
 
     def refresh(self):
         try:
@@ -269,29 +300,35 @@ class Launcher:
         except OSError as error:
             messagebox.showerror("Could not list profiles", str(error), parent=self.window)
             return
-        self.profile_picker["values"] = tuple(self.profiles)
+        for picker in self.profile_pickers:
+            picker["values"] = tuple(self.profiles)
         if self.selected.get() not in self.profiles:
-            self.selected.set(next(iter(self.profiles), ""))
+            self.selected.set("")
         self.update_summary()
 
     def update_summary(self):
         profile = self.profiles.get(self.selected.get())
         if profile is None:
-            self.summary.set("No completed profiles yet. Enter a new user ID below to enroll.")
+            message = "Choose the profile you want to verify." if self.profiles else "Enroll a hand to create your first profile."
+        elif profile.palm_model_path is None:
+            message = "Update this profile under Enroll, or select Start camera to collect new samples."
         else:
-            count = f"{profile.sample_count} samples" if profile.sample_count is not None else "sample count unavailable"
-            self.summary.set(f"{len(self.profiles)} completed profile(s)  |  Selected: {profile.user_id}  |  Latest enrollment: {count}")
+            message = "Show your open right hand in the camera for live verification."
+        self.summary.set(message)
 
-    def selected_user(self):
-        user_id = self.selected.get()
-        if user_id not in self.profiles:
-            raise ValueError("Enroll a user first, then choose their profile.")
-        return user_id
+    def selected_user(self, *, require_enrollment=False):
+        profile = self.profiles.get(self.selected.get())
+        if profile is None:
+            raise ValueError("Choose a profile. If you have none, enroll a hand first.")
+        if require_enrollment and profile.palm_model_path is None:
+            raise ValueError("Update this profile under Enroll before using this action.")
+        return profile.user_id
 
     def set_busy(self, busy):
         for widget in self.busy_controls:
             widget.configure(state="disabled" if busy else "normal")
-        self.profile_picker.configure(state="disabled" if busy else "readonly")
+        for picker in self.profile_pickers:
+            picker.configure(state="disabled" if busy else "readonly")
 
     def launch(self, action, label, user_id, **options):
         command = build_command(action, user_id, camera=self.camera.get(), **options)
@@ -299,7 +336,7 @@ class Launcher:
             raise ValueError(f"Required script is missing: {command[1]}")
         self.runner.start(command, label)
         self.set_busy(True)
-        self.status.set(f"{label} is open. Close its window with Q or Esc to return.")
+        self.status.set(f"{label} is open. Press Q or Esc in its window to return.")
 
     def handle(self, callback):
         try:
@@ -308,14 +345,19 @@ class Launcher:
             messagebox.showerror("Could not start action", str(error), parent=self.window)
 
     def enroll(self):
-        self.handle(lambda: self.launch("enroll", "Enrollment", self.new_user.get().strip()))
+        def start():
+            user_id = self.new_user.get().strip()
+            previous = self.profiles.get(user_id)
+            self.launch("enroll", "Enrollment", user_id)
+            self.pending_enrollment = (user_id, previous.palm_model_path if previous else None)
+        self.handle(start)
 
     def live(self):
         self.handle(lambda: self.launch("live", "Webcam verification", self.selected_user()))
 
     def photo(self):
         def choose():
-            user_id = self.selected_user()
+            user_id = self.selected_user(require_enrollment=True)
             path = filedialog.askopenfilename(
                 parent=self.window, title="Choose a hand photo",
                 filetypes=[("Images", "*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp"), ("All files", "*.*")],
@@ -324,13 +366,11 @@ class Launcher:
                 self.launch("photo", "Photo verification", user_id, image_path=path)
         self.handle(choose)
 
-    def use_selected_actual(self):
-        self.handle(lambda: self.actual.set(self.selected_user()))
-
     def experiment(self):
         self.handle(lambda: self.launch(
-            "experiment", "Manual experiment", self.selected_user(),
+            "experiment", "Experiment", self.selected_user(require_enrollment=True),
             actual_id=self.actual.get().strip(), condition=self.condition.get(),
+            distance_cm=self.distance.get(), scale=self.scale.get(),
         ))
 
     def poll(self):
@@ -338,8 +378,20 @@ class Launcher:
         if result is not None:
             self.set_busy(False)
             self.refresh()
+            pending = self.pending_enrollment
+            self.pending_enrollment = None
             if result.returncode == 0:
-                self.status.set(f"{result.label} closed. Ready for the next action.")
+                self.status.set(f"{result.label} closed.")
+                if pending is not None:
+                    user_id, previous_path = pending
+                    profile = self.profiles.get(user_id)
+                    if profile and profile.palm_model_path and profile.palm_model_path != previous_path:
+                        self.selected.set(user_id)
+                        self.update_summary()
+                        self.tabs.select(self.verify_tab)
+                        self.status.set(f"Enrollment saved for {user_id}.")
+                    else:
+                        self.status.set("Enrollment closed before saving a new profile.")
             else:
                 self.status.set(f"{result.label} stopped with exit code {result.returncode}. See the log in outputs/launcher.")
                 messagebox.showerror(

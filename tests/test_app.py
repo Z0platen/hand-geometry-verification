@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from app import ChildRunner, build_command, camera_index, condition_label, list_profiles, process_error_detail, validate_profile_id
+from app import ChildRunner, Launcher, build_command, camera_index, condition_label, list_profiles, process_error_detail, validate_profile_id
 
 
 class LauncherTests(unittest.TestCase):
@@ -43,6 +43,26 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(profile.model_path, latest)
         self.assertIsNone(profile.sample_count)
 
+    def test_palm_only_profile_is_listed_and_has_separate_model_path(self):
+        directory = self.root / "palm_user" / "20261118-palm"
+        directory.mkdir(parents=True)
+        path = directory / "palm_model.json"
+        path.write_text(json.dumps({"enrollment_counts": {"palm_user": 10}}), encoding="utf-8")
+        profile, = list_profiles(self.root)
+        self.assertIsNone(profile.model_path)
+        self.assertEqual(profile.palm_model_path, path)
+        self.assertEqual(profile.sample_count, 10)
+
+    def test_experiment_preserves_declared_distance_scale_and_subject(self):
+        command = build_command("experiment", "demo", actual_id="other", distance_cm="40", scale="0.5")
+        self.assertIn("--distance-cm=40", command)
+        self.assertIn("--scale=0.5", command)
+        self.assertIn("--actual=other", command)
+        self.assertNotIn("--reenroll", command)
+        for changes in ({"distance_cm": "nan"}, {"distance_cm": "-10"}, {"scale": "0"}, {"scale": "2"}):
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                build_command("experiment", "demo", actual_id="other", **changes)
+
     def test_validation_rejects_path_ids_and_invalid_cameras(self):
         self.assertEqual(validate_profile_id("P01_demo-2"), "P01_demo-2")
         for value in ("", "../P01", "a/b", "a\\b", "two words", "üser", "x" * 33, None):
@@ -56,38 +76,62 @@ class LauncherTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 condition_label(value)
 
-    def test_commands_preserve_spaces_and_pass_explicit_identity(self):
+    def test_all_workflows_launch_combined_demo(self):
         project = self.root / "project with spaces"
         image = self.root / "my photo.png"
         image.write_bytes(b"synthetic test file")
-        command = build_command("photo", "P01", image_path=image, root=project)
-        self.assertEqual(command, [str(Path(sys.executable).resolve()), str(project / "verify.py"),
-                                  "--user=P01", "--image", str(image), "--show"])
-        command = build_command("experiment", "P01", actual_id="P02", condition="low light", camera="1", root=project)
-        self.assertEqual(command[2:], ["--user=P01", "--actual=P02", "--condition=low light", "--camera", "1"])
-        self.assertEqual(build_command("enroll", "P01", root=project)[1], str(project / "enroll.py"))
-        self.assertEqual(build_command("live", "P01", root=project)[1], str(project / "verify.py"))
+        prefix = [str(Path(sys.executable).resolve()), str(project / "palm_demo.py"), "--user=P01"]
+        self.assertEqual(build_command("photo", "P01", image_path=image, root=project),
+                         prefix + ["--image", str(image), "--show"])
+        self.assertEqual(
+            build_command("experiment", "P01", actual_id="P02", condition="low light", camera="1", root=project),
+            prefix + ["--camera", "1", "--actual=P02", "--condition=low light", "--scale=1"],
+        )
+        self.assertEqual(build_command("enroll", "P01", root=project), prefix + ["--camera", "0", "--reenroll"])
+        self.assertEqual(build_command("live", "P01", root=project), prefix + ["--camera", "0"])
         with self.assertRaises(ValueError):
             build_command("photo", "P01", image_path=self.root / "missing.png")
 
     def test_leading_hyphen_values_reach_real_child_profile_lookup(self):
         image = self.root / "synthetic.png"
-        image.write_bytes(b"synthetic; not decoded because no profile exists")
+        image.write_bytes(b"synthetic; file is not decoded without enrollment")
         commands = [
             build_command("photo", "-claimed", image_path=image),
-            build_command("experiment", "-claimed", actual_id="-actual", condition="-far"),
+            build_command("experiment", "-claimed", actual_id="-actual", condition="-far")
+            + ["--image", str(image)],
         ]
         for command in commands:
-            # An isolated empty capture root forces exit before image decoding,
-            # detector creation, or opening a camera. Exit 1 from profile lookup
-            # proves the real child parser accepted every leading-hyphen value.
-            with self.subTest(script=command[1]):
+            with self.subTest(command=command):
                 result = subprocess.run(
                     command + ["--captures", str(self.root / "empty")],
                     capture_output=True, text=True, timeout=30,
                 )
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("No completed enrollment for '-claimed'", result.stderr)
+                self.assertIn("Palm study error:", result.stderr)
+
+    def test_verification_uses_selected_profile_independently_of_enrollment_entry(self):
+        launcher = Launcher.__new__(Launcher)
+        launcher.selected = Mock()
+        launcher.selected.get.return_value = "claimed"
+        launcher.new_user = Mock()
+        launcher.new_user.get.return_value = "different_person"
+        launcher.profiles = {"claimed": Mock(user_id="claimed")}
+        launcher.launch = Mock()
+        launcher.live()
+        launcher.launch.assert_called_once_with("live", "Webcam verification", "claimed")
+        with patch("app.filedialog.askopenfilename", return_value="synthetic.png"):
+            launcher.window = Mock()
+            launcher.photo()
+        launcher.launch.assert_called_with("photo", "Photo verification", "claimed", image_path="synthetic.png")
+
+    def test_legacy_profile_requires_upgrade_for_photo_or_experiment(self):
+        launcher = Launcher.__new__(Launcher)
+        launcher.selected = Mock()
+        launcher.selected.get.return_value = "legacy"
+        launcher.profiles = {"legacy": Mock(user_id="legacy", palm_model_path=None)}
+        self.assertEqual(launcher.selected_user(), "legacy")
+        with self.assertRaisesRegex(ValueError, "Update this profile under Enroll"):
+            launcher.selected_user(require_enrollment=True)
 
     def test_blank_identity_errors_name_the_required_field(self):
         with self.assertRaisesRegex(ValueError, "Enter the Actual person ID"):

@@ -1,6 +1,91 @@
-# Webcam Hand Geometry Verification
+# Hand Geometry and Palmprint Verification
 
-A Biometrics course project at Sapienza University of Rome. The project studies claimed-identity verification using the geometry of an open right hand.
+A Biometrics course project at Sapienza University of Rome. The application verifies a claimed identity using the geometry and central-palm texture of an open right hand in one combined comparison.
+
+## Combined hand enrollment and verification
+
+The desktop application uses one enrollment and one verification workflow. Each of 10 manually captured images supplies both finger-to-palm ratios and an aligned palmprint descriptor. The verification screen displays a single combined ACCEPT / REJECT result.
+
+The repository includes `configs/palm_reference.json`, containing the trained palm projection, operating thresholds, normalization scales, descriptor settings, and experiment provenance. Personal templates are created locally during enrollment. After installing the Python packages and downloading `hand_landmarker.task`, the interactive combined workflow can start directly from the code checkout.
+
+Use `start.cmd` for the desktop menu, or use CMD:
+
+```cmd
+.venv\Scripts\python.exe palm_demo.py --user musa
+```
+
+The first run collects the user's hand samples. Press **Space** or click **Save sample** to save each usable image, remove the hand, and show it again. The progress bar counts saved samples. Later runs use the latest completed `captures/USER/SESSION/palm_model.json`. `--reenroll` creates a fresh session. **S** saves the displayed comparison and its results. **Q / Esc** closes the window.
+
+Four subtle corner guides show the exact source region used for palm analysis. The main view displays a contrast-enhanced palm detail image and a current readiness message. Press **D** to show the raw crop, Gabor responses, and acquisition measurements. Contrast enhancement in this preview is a display operation. The recognizer uses its calibrated feature pipeline.
+
+Palm samples are stored as lossless PNG images with their measurements. The palm crop is normalized to 128 × 128 pixels and described using six Gabor orientations over an 8 × 8 grid, producing 384 normalized texture features. The source crop must span at least 64 pixels and have grayscale standard deviation at least 3. Sharpness is recorded for analysis. This descriptor measures local line and texture responses.
+
+The initial handcrafted baseline uses an equal-weight average of geometry and palm distances, each divided by its calibration genuine-distance median. Each operating threshold minimizes calibration balanced error. The table below records this initial baseline on the same enrolled users and held-out photographs.
+
+| Method | Test FMR | Test FNMR |
+| --- | --- | --- |
+| Hand geometry ratios | 22.99% | 31.08% |
+| Palm texture | 2.61% | 18.50% |
+| Combined score | 13.54% | 24.84% |
+
+![Geometry, palm texture, and combined verification on the same test probes](docs/palm_comparison.png)
+
+This run processed 2,813 right-palmar photographs, with 2,778 usable paired measurements. The common cohort contains 174 users, 1,015 enrollment images, 739 calibration images, and 962 test images. Each method has 962 genuine and 166,426 impostor test comparisons. Palm texture performs best in this initial image-split experiment. Equal-weight fusion improves on geometry alone. Future capture sessions and volunteers are required to measure webcam operating performance.
+
+Full results are generated under `outputs/palm_evaluation/`. To reproduce the calibration and comparison:
+
+```cmd
+.venv\Scripts\python.exe prepare_palm.py --archive "C:\path\to\Hands.zip" --metadata "C:\path\to\HandInfo.csv" --output outputs\palm_evaluation
+```
+
+## Trained palm recognition
+
+The default reference now includes a supervised regularized Linear Discriminant Analysis projection. It learns 64 dimensions from the 384 raw palm features, using only the 1,015 enrollment images from 174 identities. The within-class covariance uses fixed shrinkage 0.1. Projection fitting uses the enrollment partition, while threshold selection and normalization use the separate 739-image calibration partition.
+
+Fusion tests the preregistered palm weights 0.25, 0.5, and 0.75 on calibration images. The selected weight is 0.75 for palm and 0.25 for hand geometry. Both components contribute to the single application verdict. The resulting frozen model is evaluated on the 962 held-out images.
+
+| Method | Test FMR | Test FNMR |
+| --- | --- | --- |
+| Initial palm texture | 2.61% | 18.50% |
+| Trained palm metric | 0.68% | 2.49% |
+| Initial combined score | 13.54% | 24.84% |
+| Trained combined score | 1.97% | 6.24% |
+
+![Training comparison on held-out images](docs/palm_trained_comparison.png)
+
+Training and inference use the same raw descriptor and projected-distance calculation. Cached raw personal descriptors remain compatible. The reference used when creating a profile freezes that profile's metric and thresholds. The evaluated identities also appear in enrollment, so independent volunteers and capture sessions are needed to assess webcam generalization.
+
+After preparing the dataset features, reproduce training with:
+
+```cmd
+.venv\Scripts\python.exe train_palm.py
+```
+
+The output directory `outputs/palm_trained/` contains the full model, aggregate reference, comparison plot, and summary. The public aggregate reference contains learned weights and calibration information. Personal templates remain in local capture sessions.
+
+Live capture requests 1280 × 720 pixels by default, and the preview shows the actual input dimensions returned by the camera. `--camera-width` and `--camera-height` can request another supported mode. If the palm crop is too small, the preview guides the user to move closer while keeping the full hand visible. Personal registration stores reference samples for a user of the trained recognizer.
+
+## Distance and resolution study
+
+For a live experiment, declare the person presenting the hand and measure camera distance with a ruler or tape measure. Press **T** to record each attempt. The three component comparisons, image-quality measurements, distance, and digital scale are saved under `outputs/palm_trials/` as JSON and CSV. A failed palm or geometry measurement produces an unavailable combined decision and is counted as a feature-extraction failure.
+
+```cmd
+.venv\Scripts\python.exe palm_demo.py --user musa --actual musa --distance-cm 40 --condition day1 --scale 1
+```
+
+Change `--actual` for an impostor volunteer. Change the measured distance across runs while retaining the same saved enrollment. `--scale 0.5` digitally resizes the entire camera input before detection, allowing a controlled resolution experiment. The stored `distance_cm` is the operator's physical measurement, and `input_scale` is the digital downsampling factor.
+
+To repeat the resolution experiment on held-out dataset images with frozen thresholds:
+
+```cmd
+.venv\Scripts\python.exe palm_robustness.py --archive "C:\path\to\Hands.zip" --model outputs\palm_evaluation\model.json --splits outputs\palm_evaluation\splits.csv --scales 1 0.5 0.25 --output outputs\palm_robustness
+```
+
+This experiment verifies the original split manifest and image hashes, resizes whole photographs, redetects landmarks, and reports coverage plus error rates for each method's valid probes and the common-valid subset. Image downsampling provides controlled resolution measurements. Physical distance results come from the separately measured webcam sessions.
+
+The full resolution study used all 962 held-out images with fixed original calibration. At scale 0.5, 955 probes had both usable components. Conditional palm FMR/FNMR were 2.00%/19.35%, and combined FMR/FNMR were 12.80%/24.29%. At scale 0.25, every palm crop fell below the frozen 64-pixel source-size requirement, so palm and combined comparison rates are unavailable. Acquisition coverage is reported alongside the conditional error rates.
+
+![Resolution study showing valid coverage and error rates at frozen thresholds](docs/palm_resolution.png)
 
 ## What changed in this version
 
@@ -29,6 +114,10 @@ These changes address correctness and usability. The image-split results below r
 ## Current implementation
 
 - `app.py` provides a desktop menu for profile selection, enrollment, verification, and manual experiments.
+- `palm_demo.py` and `palm_enrollment.py` implement the combined camera/photo workflow and paired personal capture sessions.
+- `palmprint.py` extracts aligned palm texture, and `multimodal.py` scores the combined model.
+- `prepare_palm.py` calibrates and evaluates the three research baselines on matched data splits.
+- `palm_trials.py` records measured-distance trials, and `palm_robustness.py` evaluates resolution changes at frozen thresholds.
 - `pilot.py` displays live landmarks, five finger lengths in pixels, and ratios to a palm-width proxy.
 - `geometry.py` defines the shared measurements and acquisition-quality checks.
 - `extract_features.py` reads the 11K Hands ZIP and metadata and writes right-palmar measurements and failure statuses to CSV.
@@ -61,11 +150,11 @@ Double-click **start.cmd**, or run it from the repository folder:
 start.cmd
 ```
 
-The menu lists completed personal profiles and shows the sample count for the latest session. Choose a **Selected profile**, then use **Verify with webcam** or **Verify a photo** to compare a hand against it. To create a profile, fill in **New user ID** and click **Enroll new user**. Choose a camera index if needed. Close the active window with **Q** or **Esc** before starting another action. Use **Refresh** to reload the profile list.
+The menu has three compact tabs. Under **Enroll**, enter a user ID and choose **Enroll hand** to capture the paired geometry and palm samples. Under **Verify**, select a profile and use **Start camera** or **Choose photo**. The camera shows a live combined result. Close the active window with **Q** or **Esc** to return. Profiles refresh automatically when an action finishes.
 
-For **Run experiment**, fill in **Actual person ID** with the ID of the person showing their hand. When testing your own profile, click **Use selected profile ID** to copy that ID into the field. For a different volunteer, type their ID. Enter a **Condition** such as `day1-normal` or `day2-far`. The panel identifies which field needs attention if a required ID is missing or invalid.
+Under **Experiments**, select a profile, enter the **Actual person ID**, and choose **Run experiment**. Use the selected profile's ID for genuine attempts or a volunteer's ID for impostor attempts. The tab also holds the condition, measured distance, digital input scale, and camera index. Press **T** in the camera window to record each attempt. The panel identifies which field needs attention if a required value is missing or invalid.
 
-The Python environment and model setup above are required. Personal enrollment also requires the generated dataset ratio model described below. The menu launches the same scripts and preserves their experimental limitations.
+The combined workflow uses the included aggregate reference `configs/palm_reference.json`. The Python environment and Hand Landmarker setup above are required. Profiles created with the original geometry workflow collect a fresh paired enrollment when upgraded through the camera.
 
 ## Save a screenshot and decision
 
@@ -75,7 +164,7 @@ Screenshots are local biometric records and remain Git-ignored. One saved result
 
 ## Collect webcam test attempts
 
-After creating a personal profile, use the menu's experiment action or run:
+The commands in this section reproduce the earlier geometry-only experiments. The menu's Experiments tab uses the combined workflow described above. For the earlier pipeline, run:
 
 ```cmd
 .venv\Scripts\python.exe experiment.py --user musa --actual musa --condition day1-normal --camera 0
@@ -223,3 +312,5 @@ Store biometric captures, derived features, and exported templates under `data/`
 
 - Mahmoud Afifi, *11K Hands: Gender recognition and biometric identification using a large dataset of hand images*, Multimedia Tools and Applications, 2019. [Dataset and citation](https://sites.google.com/view/11khands/home).
 - Google, [MediaPipe Hand Landmarker](https://developers.google.com/edge/mediapipe/solutions/vision/hand_landmarker/python).
+- Adams Kong, David Zhang, Mohamed Kamel, *Palmprint identification using feature-level fusion*, Pattern Recognition, 2006. [Paper](https://doi.org/10.1016/j.patcog.2005.08.014).
+- Loris Nanni, Alessandra Lumini, *Ensemble of multiple Palmprint representation*, Expert Systems with Applications, 2009. [Paper](https://doi.org/10.1016/j.eswa.2008.05.008).
