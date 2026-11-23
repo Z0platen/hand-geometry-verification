@@ -134,9 +134,24 @@ def project_features(raw, metric):
     """Center, project, and normalize one raw descriptor or a matrix of descriptors."""
     samples = _raw_descriptors(raw)
     mean, projection = _metric_arrays(metric)
+    return _project_features_with_arrays(samples, mean, projection)
+
+
+def _project_features_with_arrays(samples, mean, projection):
+    """Project already-normalized descriptors with already-validated arrays."""
     with np.errstate(over="ignore", invalid="ignore"):
         projected = np.einsum("...i,ij->...j", samples - mean, projection)
         norms = np.linalg.norm(projected, axis=-1, keepdims=True)
     if not np.isfinite(norms).all() or np.any(norms == 0):
         raise ValueError("The learned palm projection must have a finite, nonzero norm.")
     return projected / norms
+
+
+class _PreparedPalmProjector:
+    """Validated projection arrays for repeated probes against one fixed metric."""
+
+    def __init__(self, metric):
+        self._mean, self._projection = _metric_arrays(metric)
+
+    def __call__(self, raw):
+        return _project_features_with_arrays(_raw_descriptors(raw), self._mean, self._projection)

@@ -22,6 +22,19 @@ class LauncherTests(unittest.TestCase):
         model.write_text(json.dumps({"enrollment_counts": {user_id: count}}), encoding="utf-8")
         return model
 
+    def make_palm_session(self, user_id, session_id, *, changes=None):
+        directory = self.root / user_id / session_id
+        directory.mkdir(parents=True)
+        reference_path = Path(__file__).resolve().parents[1] / "configs" / "palm_reference.json"
+        model = json.loads(reference_path.read_text(encoding="utf-8"))
+        model.pop("reference_kind")
+        if changes:
+            changes(model)
+        model.update({"model_kind": "palm_geometry", "enrollment_counts": {user_id: 10}})
+        path = directory / "palm_model.json"
+        path.write_text(json.dumps(model), encoding="utf-8")
+        return path
+
     def test_profiles_use_latest_completed_session_and_ignore_incomplete(self):
         self.make_session("P01", "20260101", 5)
         latest = self.make_session("P01", "20260201", 10)
@@ -52,6 +65,46 @@ class LauncherTests(unittest.TestCase):
         self.assertIsNone(profile.model_path)
         self.assertEqual(profile.palm_model_path, path)
         self.assertEqual(profile.sample_count, 10)
+
+    def test_profile_reports_current_saved_calibration_and_weights(self):
+        self.make_palm_session("current", "session")
+        profile, = list_profiles(self.root)
+        self.assertEqual(profile.calibration_status, "current")
+        self.assertAlmostEqual(profile.palm_weight, 0.95)
+        self.assertAlmostEqual(profile.geometry_weight, 0.05)
+
+    def test_profile_reports_a_different_complete_calibration(self):
+        def use_historical_weights(model):
+            model["fusion"]["weights"] = {"geometry": 0.25, "palm": 0.75}
+        self.make_palm_session("different", "session", changes=use_historical_weights)
+        profile, = list_profiles(self.root)
+        self.assertEqual(profile.calibration_status, "different")
+        self.assertAlmostEqual(profile.palm_weight, 0.75)
+
+    def test_training_provenance_does_not_make_same_matcher_look_different(self):
+        def change_provenance(model):
+            model["palm_metric"]["training_samples"] += 1
+            model["palm_metric"]["numpy_version"] = "synthetic"
+            model["fusion"]["calibration_details"]["source_note"] = "synthetic"
+        self.make_palm_session("same_matcher", "session", changes=change_provenance)
+        profile, = list_profiles(self.root)
+        self.assertEqual(profile.calibration_status, "current")
+
+    def test_malformed_projection_is_unknown(self):
+        def remove_projection(model):
+            del model["palm_metric"]["projection"]
+        self.make_palm_session("bad_projection", "session", changes=remove_projection)
+        profile, = list_profiles(self.root)
+        self.assertEqual(profile.calibration_status, "unknown")
+        self.assertIsNone(profile.palm_weight)
+
+    def test_missing_or_malformed_calibration_is_unknown(self):
+        def remove_thresholds(model):
+            del model["thresholds"]
+        self.make_palm_session("missing", "session", changes=remove_thresholds)
+        profile, = list_profiles(self.root)
+        self.assertEqual(profile.calibration_status, "unknown")
+        self.assertIsNone(profile.palm_weight)
 
     def test_experiment_preserves_declared_distance_scale_and_subject(self):
         command = build_command("experiment", "demo", actual_id="other", distance_cm="40", scale="0.5")
@@ -132,6 +185,26 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(launcher.selected_user(), "legacy")
         with self.assertRaisesRegex(ValueError, "Update this profile under Enroll"):
             launcher.selected_user(require_enrollment=True)
+
+    def test_update_selected_profile_prefills_same_user_without_enrolling(self):
+        launcher = Launcher.__new__(Launcher)
+        launcher.selected = Mock()
+        launcher.selected.get.return_value = "existing_user"
+        launcher.new_user = Mock()
+        launcher.tabs = Mock()
+        launcher.enroll_tab = object()
+        launcher.profiles = {"existing_user": Mock(user_id="existing_user")}
+        launcher.prepare_update()
+        launcher.new_user.set.assert_called_once_with("existing_user")
+        launcher.tabs.select.assert_called_once_with(launcher.enroll_tab)
+
+    def test_view_results_does_not_require_a_selected_profile(self):
+        launcher = Launcher.__new__(Launcher)
+        launcher.window = Mock()
+        launcher.results_window = None
+        with patch("app.PalmResultsWindow") as viewer:
+            launcher.show_results()
+        viewer.assert_called_once_with(launcher.window, Path(__file__).resolve().parents[1] / "outputs" / "palm_trials")
 
     def test_blank_identity_errors_name_the_required_field(self):
         with self.assertRaisesRegex(ValueError, "Enter the Actual person ID"):

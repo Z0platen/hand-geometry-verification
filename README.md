@@ -182,11 +182,19 @@ Double-click **start.cmd**, or run it from the repository folder:
 start.cmd
 ```
 
-The menu has three compact tabs. Under **Enroll**, enter a user ID and choose **Enroll hand** to capture the paired geometry and palm samples. Under **Verify**, select a profile and use **Start camera** or **Choose photo**. The camera shows a live combined result. Close the active window with **Q** or **Esc** to return. Profiles refresh automatically when an action finishes.
+The menu has three compact tabs. Under **Enroll**, enter a user ID and choose **Enroll hand** to capture the paired geometry and palm samples. Under **Verify**, select a profile and use **Start camera** or **Choose photo**. Its summary shows the saved palm/geometry fusion weights and whether its matcher calibration matches the bundled default; incomplete metadata is shown as unknown. Profiles retain the calibration saved at enrollment, so use **Update selected profile**, then choose **Enroll hand**, to create a new session for that same ID using current defaults. Enrollment starts only when you choose **Enroll hand**. The camera shows a live combined result. Close the active window with **Q** or **Esc** to return. Profiles refresh automatically when an action finishes.
 
-Under **Experiments**, select a profile, enter the **Actual person ID**, and choose **Run experiment**. Use the selected profile's ID for genuine attempts or a volunteer's ID for impostor attempts. The tab also holds the condition, measured distance, digital input scale, and camera index. Press **T** in the camera window to record each attempt. The panel identifies which field needs attention if a required value is missing or invalid.
+Under **Experiments**, select a profile, enter the **Actual person ID**, and choose **Run experiment**. Use the selected profile's ID for genuine attempts or a volunteer's ID for impostor attempts. The tab also holds the condition, measured distance, digital input scale, and camera index. Press **T** in the camera window to record each attempt. The panel identifies which field needs attention if a required value is missing or invalid. Choose **View results** to review saved attempts without selecting a profile; **Refresh** reads the metadata again and works while a capture session is open. The compact table groups each model, condition, distance, and input scale separately. FMR is false accepts divided by valid impostor comparisons; FNMR is false rejects divided by valid genuine comparisons. Acquisition failures are excluded from both rates, shown separately, and remain in attempt totals. The selected-group details include run and profile IDs, the full model hash, genuine/impostor totals, comparisons, coverage, and thresholds. **Save HTML…** writes the displayed report to a chosen path, initially `outputs/reports/`, without opening a browser.
 
-The combined workflow uses the included aggregate reference `configs/palm_reference.json`. The Python environment and Hand Landmarker setup above are required. Profiles created with the original geometry workflow collect a fresh paired enrollment when upgraded through the camera.
+To compile and save an HTML report from CMD:
+
+```cmd
+.venv\Scripts\python.exe palm_reports.py --root outputs\palm_trials
+```
+
+Without another option, the CLI chooses a unique HTML filename in `outputs/reports/`. To use a fixed path, run `.venv\Scripts\python.exe palm_reports.py --root outputs\palm_trials --output outputs\reports\summary.html`.
+
+The combined workflow uses the included aggregate reference `configs/palm_reference.json`. The Python environment and Hand Landmarker setup above are required. Profiles created with the original geometry workflow collect a fresh paired enrollment when upgraded through the camera. Live verification prepares the saved model and palm projection once per camera session, rebuilding them after a new enrollment completes; frames reuse those settings without changing saved thresholds or scores. Live camera display starts mirrored; press **M** to toggle it. **F** toggles the display-only hand-focused viewport, which starts on and falls back to full view unless the current frame has one complete in-frame hand; any available palm guides must also fit safely. Zooming the display does not increase the palm crop's native pixels or relax its configured 64-pixel quality gate. Analysis, scoring, and enrollment continue to use the full original camera frame; photo verification is always full-view and unmirrored. The camera overlay reports current hand presence, with distinct live prompts for no hand and tracked but unusable frames. Prompts guide whole-hand framing, the configured minimum palm crop, and even lighting.
 
 ## Save a screenshot and decision
 
@@ -334,11 +342,12 @@ The focused checks cover geometry scaling and image aspect ratio, cropped/invali
 
 Store biometric captures, derived features, and exported templates under `data/`, `captures/`, or `outputs/`. Git ignores these directories, the Python environment, and downloaded models. The source dataset's academic-use terms and citation apply to its images.
 
-## Next steps
+## Roadmap
 
-- Collect personal webcam sessions on different days with several volunteers.
-- Calibrate a webcam threshold using separate genuine and impostor comparisons, then freeze it before testing.
-- Measure distance and pose sensitivity and compare additional geometry features against these initial baselines.
+- **V1 — Desktop usability (implemented):** unified enrollment, verification, and experiments, with saved calibration awareness and explicit profile updates.
+- **V2 — Local trial reporting (implemented):** fusion results grouped by model, condition, distance, and input scale, with conditional denominators, warnings, and HTML export.
+- **V3 — Live camera guidance (implemented):** current tracking overlay, display-only **M** mirror and default-on **F** focus controls, with prompts for whole-hand framing, the minimum palm crop, and lighting. The viewport falls back to full view when the current hand or any available ROI cannot fit safely; display zoom does not change native crop quality. Analysis and capture use the original frame. Step-by-step coaching through the enrollment sample sequence remains future work.
+- **V4 — Cross-session evaluation (planned):** collect later sessions and additional volunteers, then calibrate and evaluate on separate data before drawing webcam-performance conclusions.
 
 ## References
 

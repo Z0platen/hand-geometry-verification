@@ -13,8 +13,53 @@ import sys
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from multimodal import validate_reference
+from palm_results import PalmResultsWindow
 
 ROOT = Path(__file__).resolve().parent
+CALIBRATION_FIELDS = (
+    "schema_version", "descriptor_version", "geometry_feature_names", "palm_feature_size",
+    "quality", "fusion", "thresholds",
+)
+
+
+def _calibration_signature(model):
+    """Return the actual matcher settings needed for a reliable calibration comparison."""
+    if not isinstance(model, dict) or any(field not in model for field in CALIBRATION_FIELDS):
+        return None
+    fusion = model.get("fusion")
+    if not isinstance(fusion, dict) or not isinstance(fusion.get("weights"), dict):
+        return None
+    weights = fusion["weights"]
+    if set(weights) != {"geometry", "palm"}:
+        return None
+    try:
+        palm_weight = float(weights["palm"])
+        geometry_weight = float(weights["geometry"])
+        if not all(math.isfinite(weight) and 0 < weight < 1 for weight in (palm_weight, geometry_weight)):
+            return None
+        if not math.isclose(palm_weight + geometry_weight, 1.0, rel_tol=0, abs_tol=1e-12):
+            return None
+        calibration = {field: model[field] for field in CALIBRATION_FIELDS}
+        if "palm_metric" in model:
+            calibration["palm_metric"] = model["palm_metric"]
+        validate_reference({**calibration, "reference_kind": "palm_geometry_calibration"})
+        comparison = dict(calibration)
+        comparison["fusion"] = {
+            key: fusion[key] for key in ("geometry_scale", "palm_scale", "weights")
+        }
+        if "palm_metric" in model:
+            metric = model["palm_metric"]
+            comparison["palm_metric"] = {
+                key: metric[key] for key in ("kind", "input_size", "output_size", "mean", "projection")
+            }
+        signature = json.dumps(
+            comparison,
+            sort_keys=True, allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return signature, palm_weight, geometry_weight
 
 
 def validate_profile_id(value, field="User ID"):
@@ -50,14 +95,22 @@ class Profile:
     sample_count: int | None
     session_count: int
     palm_model_path: Path | None = None
+    calibration_status: str = "unknown"
+    palm_weight: float | None = None
+    geometry_weight: float | None = None
 
 
-def list_profiles(captures_root):
+def list_profiles(captures_root, reference_path=None):
     """Read completed-session metadata only; never open biometric images."""
     captures_root = Path(captures_root).resolve()
     if not captures_root.is_dir():
         return []
     profiles = []
+    try:
+        reference = json.loads(Path(reference_path or ROOT / "configs" / "palm_reference.json").read_text(encoding="utf-8"))
+        reference_signature = _calibration_signature(reference)
+    except (OSError, UnicodeError, ValueError, TypeError):
+        reference_signature = None
     for user_directory in sorted(captures_root.iterdir(), key=lambda path: path.name.casefold()):
         try:
             user_id = validate_profile_id(user_directory.name)
@@ -77,6 +130,7 @@ def list_profiles(captures_root):
         latest_palm = max(palm_models, key=lambda path: path.parent.name) if palm_models else None
         latest = latest_palm or latest_geometry
         sample_count = None
+        model = None
         try:
             model = json.loads(latest.read_text(encoding="utf-8"))
             count = model.get("enrollment_counts", {}).get(user_id) if isinstance(model, dict) else None
@@ -84,8 +138,18 @@ def list_profiles(captures_root):
                 sample_count = count
         except (OSError, UnicodeError, ValueError, AttributeError):
             pass
+        saved_signature = _calibration_signature(model)
+        calibration_status = "unknown"
+        palm_weight = geometry_weight = None
+        if saved_signature is not None:
+            _, palm_weight, geometry_weight = saved_signature
+            if reference_signature is not None:
+                calibration_status = "current" if saved_signature[0] == reference_signature[0] else "different"
         session_count = len({path.parent for path in models + palm_models})
-        profiles.append(Profile(user_id, latest_geometry, sample_count, session_count, latest_palm))
+        profiles.append(Profile(
+            user_id, latest_geometry, sample_count, session_count, latest_palm,
+            calibration_status, palm_weight, geometry_weight,
+        ))
     return profiles
 
 
@@ -222,6 +286,7 @@ class Launcher:
         self.summary = tk.StringVar()
         self.status = tk.StringVar(value="Ready.")
         self.pending_enrollment = None
+        self.results_window = None
         window.title("Hand Verification")
         window.minsize(540, 460)
         window.geometry("680x490")
@@ -245,6 +310,9 @@ class Launcher:
         actions.grid(row=2, column=0, columnspan=2, sticky="w", pady=(16, 0))
         self.add_button(actions, "Start camera", self.live).pack(side="left", padx=(0, 10))
         self.add_button(actions, "Choose photo", self.photo).pack(side="left")
+        self.add_button(self.verify_tab, "Update selected profile", lambda: self.handle(self.prepare_update)).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(10, 0),
+        )
 
         self.add_entry(self.enroll_tab, "New user ID", self.new_user, row=0)
         ttk.Label(
@@ -261,9 +329,10 @@ class Launcher:
         self.add_entry(experiment, "Measured distance (cm, optional)", self.distance, row=3)
         self.add_entry(experiment, "Digital input scale", self.scale, row=4)
         self.add_entry(experiment, "Camera index", self.camera, row=5)
-        self.add_button(experiment, "Run experiment", self.experiment).grid(
-            row=6, column=1, sticky="w", pady=(14, 0),
-        )
+        actions = ttk.Frame(experiment)
+        actions.grid(row=6, column=1, sticky="w", pady=(14, 0))
+        self.add_button(actions, "Run experiment", self.experiment).pack(side="left")
+        ttk.Button(actions, text="View results", command=self.show_results).pack(side="left", padx=(8, 0))
 
         ttk.Label(body, textvariable=self.status, wraplength=450).pack(anchor="w", pady=(12, 0))
         self.refresh()
@@ -310,11 +379,28 @@ class Launcher:
         profile = self.profiles.get(self.selected.get())
         if profile is None:
             message = "Choose the profile you want to verify." if self.profiles else "Enroll a hand to create your first profile."
-        elif profile.palm_model_path is None:
-            message = "Update this profile under Enroll, or select Start camera to collect new samples."
         else:
-            message = "Show your open right hand in the camera for live verification."
+            if profile.palm_weight is not None and profile.geometry_weight is not None:
+                calibration_label = {
+                    "current": "current calibration",
+                    "different": "different saved calibration; re-enroll to use current defaults",
+                }.get(profile.calibration_status, "unknown calibration")
+                weighting = (
+                    f"Saved fusion: {profile.palm_weight:.0%} palm / "
+                    f"{profile.geometry_weight:.0%} geometry; {calibration_label}."
+                )
+            else:
+                weighting = "Saved calibration: unknown."
+            if profile.palm_model_path is None:
+                message = f"{weighting} Update this profile under Enroll to collect paired samples."
+            else:
+                message = f"{weighting} Show your open right hand in the camera for live verification."
         self.summary.set(message)
+
+    def prepare_update(self):
+        user_id = self.selected_user()
+        self.new_user.set(user_id)
+        self.tabs.select(self.enroll_tab)
 
     def selected_user(self, *, require_enrollment=False):
         profile = self.profiles.get(self.selected.get())
@@ -372,6 +458,18 @@ class Launcher:
             actual_id=self.actual.get().strip(), condition=self.condition.get(),
             distance_cm=self.distance.get(), scale=self.scale.get(),
         ))
+
+    def show_results(self):
+        if self.results_window is not None:
+            try:
+                if self.results_window.winfo_exists():
+                    self.results_window.refresh()
+                    self.results_window.deiconify()
+                    self.results_window.lift()
+                    return
+            except tk.TclError:
+                self.results_window = None
+        self.results_window = PalmResultsWindow(self.window, ROOT / "outputs" / "palm_trials")
 
     def poll(self):
         result = self.runner.poll()

@@ -27,8 +27,44 @@ def make_preview(frame, hands, *, title=WINDOW_NAME, measurements=None):
     label(title, 12, 27, 0.58)
     label("Q / Esc to close", 12, 224)
     if measurements is None:
-        measurements = analyze_hand(hands, width, height)
-    if measurements["status"] != "ok":
+        try:
+            measurements = analyze_hand(hands, width, height)
+        except (AttributeError, IndexError, OverflowError, TypeError, ValueError):
+            measurements = {"status": "invalid_landmarks"}
+
+    def visible_points(hand):
+        drawing_points = {}
+        try:
+            iterator = enumerate(hand)
+            for index, point in iterator:
+                if not 0 <= index < 21:
+                    continue
+                try:
+                    x = float(point.x) * width
+                    y = float(point.y) * height
+                except (AttributeError, OverflowError, TypeError, ValueError):
+                    continue
+                if isfinite(x) and isfinite(y) and 0 <= x < width and 0 <= y < height:
+                    drawing_points[index] = (int(x), int(y))
+        except TypeError:
+            return {}
+        return drawing_points
+
+    try:
+        current_hands = hands if hands is not None else ()
+        for hand in current_hands:
+            drawing_points = visible_points(hand)
+            for edge in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS:
+                if edge.start in drawing_points and edge.end in drawing_points:
+                    cv2.line(preview, drawing_points[edge.start], drawing_points[edge.end], (42, 200, 255), 2)
+            for point in drawing_points.values():
+                cv2.circle(preview, point, 4, (70, 240, 125), -1, cv2.LINE_AA)
+    except TypeError:
+        # A malformed hand collection has no drawable current landmarks.
+        pass
+
+    status = measurements.get("status") if isinstance(measurements, dict) else None
+    if status != "ok":
         instructions = {
             "no_hand": "Show one open hand.",
             "multiple_hands": "Show only one hand.",
@@ -37,19 +73,8 @@ def make_preview(frame, hands, *, title=WINDOW_NAME, measurements=None):
             "degenerate_palm": "Move your hand closer.",
             "degenerate_finger": "Open your fingers.",
         }
-        label(instructions[measurements["status"]], 12, 64)
+        label(instructions.get(status, "Adjust your hand position."), 12, 64)
         return preview
-
-    points = [(point.x * width, point.y * height) for point in hands[0]]
-    drawing_points = {
-        index: (int(x), int(y)) for index, (x, y) in enumerate(points)
-        if isfinite(x) and isfinite(y) and 0 <= x < width and 0 <= y < height
-    }
-    for edge in mp.tasks.vision.HandLandmarksConnections.HAND_CONNECTIONS:
-        if edge.start in drawing_points and edge.end in drawing_points:
-            cv2.line(preview, drawing_points[edge.start], drawing_points[edge.end], (42, 200, 255), 2)
-    for point in drawing_points.values():
-        cv2.circle(preview, point, 4, (70, 240, 125), -1, cv2.LINE_AA)
 
     label("Feature", 12, 58)
     label("Pixels", 122, 58)

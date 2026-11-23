@@ -14,7 +14,7 @@ import numpy as np
 
 from geometry import RATIO_COLUMNS
 from palmprint import DEFAULT_QUALITY, DESCRIPTOR_VERSION, PALM_FEATURE_SIZE
-from palm_learning import project_features, validate_metric
+from palm_learning import _PreparedPalmProjector, project_features, validate_metric
 
 
 MODES = ("geometry", "palm", "fusion")
@@ -227,8 +227,9 @@ class PreparedMatcher:
         validate_model(model)
         self._metric = model.get("palm_metric")
         if self._metric is not None:
-            self._metric = {**self._metric, "mean": np.asarray(self._metric["mean"], dtype=float),
-                            "projection": np.asarray(self._metric["projection"], dtype=float)}
+            self._projector = _PreparedPalmProjector(self._metric)
+        else:
+            self._projector = None
         self.subjects = tuple(model["templates"])
         self._templates = {
             subject: {
@@ -241,7 +242,7 @@ class PreparedMatcher:
         self._scales = {name: model["fusion"][f"{name}_scale"] for name in ("geometry", "palm")}
         self._weights = dict(model["fusion"]["weights"])
         if self._metric is not None:
-            projected = project_features(np.asarray([model["templates"][subject]["palm"] for subject in self.subjects]), self._metric)
+            projected = self._projector(np.asarray([model["templates"][subject]["palm"] for subject in self.subjects]))
             for subject, vector in zip(self.subjects, projected, strict=True):
                 self._templates[subject]["palm"] = vector
 
@@ -259,7 +260,7 @@ class PreparedMatcher:
                 vectors[name] = _vector(values, size, name, unit=name == "palm")
                 statuses[name] = "ok"
         if self._metric is not None and vectors["palm"] is not None:
-            vectors["palm"] = project_features(palm, self._metric)
+            vectors["palm"] = self._projector(palm)
         return vectors, statuses
 
     def _score(self, vectors, statuses, claim):

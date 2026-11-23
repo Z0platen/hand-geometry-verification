@@ -11,8 +11,9 @@ import mediapipe as mp
 import numpy as np
 
 from enrollment import validate_user_id
+from focus_view import FocusViewport
 from geometry import RATIO_COLUMNS
-from multimodal import load_model, load_reference, score_probe
+from multimodal import PreparedMatcher, load_model, load_reference, score_probe
 from palm_enrollment import DEFAULT_CAPTURES, PalmEnrollment, latest_palm_model
 from palm_trials import PalmTrialLog
 from palmprint import analyze_palm
@@ -33,22 +34,47 @@ def analyze(frame, detector, timestamp=None, quality=None):
     return geometry, palm, hands
 
 
-def compare(geometry, palm, user_id, model):
+def compare(geometry, palm, user_id, model, matcher=None):
+    if matcher is not None:
+        return matcher.score_probe(
+            geometry["features"], palm["features"], user_id,
+            geometry_status=geometry["status"], palm_status=palm["status"],
+        )
     return score_probe(
         geometry["features"], palm["features"], user_id, model,
         geometry_status=geometry["status"], palm_status=palm["status"],
     )
 
 
-def live_guidance(geometry, palm, phase, waiting_removal):
+def live_guidance(geometry, palm, phase, waiting_removal, hands=None):
     if waiting_removal:
         return "Remove your hand completely, then show it again."
+    if hands is not None and not hands:
+        return "Show your whole right hand with fingertips in frame."
+    if hands is not None and len(hands) > 1:
+        return "Show one open right palm with your whole hand in frame."
     if geometry["status"] != "ok":
-        return CAPTURE_MESSAGES.get(geometry["status"], "Show one open right palm with every fingertip visible.")
+        if hands:
+            return {
+                "finger_out_of_frame": "Hand detected. Keep your whole hand and fingertips inside the frame.",
+                "invalid_landmarks": "Hand detected, but points are unclear. Hold steady with your whole hand in frame.",
+                "degenerate_palm": "Hand detected. Move closer while keeping your whole palm in frame.",
+                "degenerate_finger": "Hand detected. Open your fingers and keep your whole hand in frame.",
+            }.get(geometry["status"], "Hand detected. Reposition your whole hand in frame.")
+        return CAPTURE_MESSAGES.get(geometry["status"], "Show your whole right hand with fingertips in frame.")
     if palm["status"] == "palm_too_small":
-        return f"Palm detail {palm['quality']['native_roi_pixels']:.0f}px. Move closer, keeping your whole hand in view."
-    if palm["status"] == "palm_low_contrast":
-        return "Improve palm lighting. Avoid strong shadows and glare."
+        quality = palm.get("quality", {})
+        native = quality.get("native_roi_pixels", 0)
+        minimum = palm.get("minimum_roi_pixels", 64)
+        return f"Hand detected. Palm crop {native:.0f}px; need {minimum:g}px. Move closer, keeping your whole hand in frame."
+    if palm["status"] in ("palm_low_contrast", "palm_empty_texture"):
+        return "Hand detected. Use even lighting; avoid shadows and glare."
+    if palm["status"] == "palm_out_of_frame":
+        return "Hand detected. Keep your whole palm inside the frame."
+    if palm["status"] == "palm_degenerate_geometry":
+        return "Hand detected. Face your open palm toward the camera."
+    if palm["status"] == "palm_invalid_landmarks":
+        return "Hand detected. Hold steady with your whole hand in frame."
     if palm["status"] != "ok":
         return f"Adjust the palm position: {palm['status']}."
     if phase == "enrolling":
@@ -66,6 +92,7 @@ def run_camera(camera_index, detector, user_id, reference, model, captures_root=
     try:
         if not camera.isOpened():
             raise RuntimeError(f"Could not open camera {camera_index}. Try --camera 1.")
+        matcher = PreparedMatcher(model) if model is not None else None
         camera.set(cv2.CAP_PROP_FRAME_WIDTH, camera_width)
         camera.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_height)
         session = None if model is not None else PalmEnrollment(user_id, reference, captures_root, samples)
@@ -76,6 +103,9 @@ def run_camera(camera_index, detector, user_id, reference, model, captures_root=
         feedback = "Show one open right palm. Move closer if the palm input is too small."
         feedback_until_ns = 0
         show_details = False
+        mirror = True
+        focus_view = FocusViewport()
+        focus_enabled = True
         capture_clicked = False
 
         def on_mouse(event, x, y, _flags, _userdata):
@@ -97,20 +127,23 @@ def run_camera(camera_index, detector, user_id, reference, model, captures_root=
             now = monotonic_ns()
             timestamp = max(timestamp + 1, now // 1_000_000)
             geometry, palm, hands = analyze(frame, detector, timestamp, quality=(model or reference)["quality"])
+            viewport = focus_view.update(
+                frame.shape, hands, corners=palm.get("corners"), enabled=focus_enabled,
+            )
             if waiting_removal and geometry["status"] == "no_hand":
                 waiting_removal = False
                 if phase == "remove_hand":
                     phase = "verifying"
                 feedback = "Show the right palm again when ready."
-            scores = compare(geometry, palm, user_id, model) if model is not None and phase == "verifying" else None
-            guidance = live_guidance(geometry, palm, phase, waiting_removal)
+            scores = compare(geometry, palm, user_id, model, matcher) if model is not None and phase == "verifying" else None
+            guidance = live_guidance(geometry, palm, phase, waiting_removal, hands=hands)
             ready = geometry["status"] == palm["status"] == "ok" and not waiting_removal
             displayed_feedback = feedback if ready and now < feedback_until_ns else guidance
             display_phase = "remove_hand" if waiting_removal else phase
             enrollment_target = samples if phase in ("enrolling", "remove_hand") else 0
             preview = palm_preview(frame, hands, geometry, palm, scores, user_id, display_phase,
                                    session.count if session else 0, enrollment_target, displayed_feedback, actual, distance_cm, scale,
-                                   show_details=show_details)
+                                   show_details=show_details, mirror=mirror, viewport=viewport)
             cv2.imshow(WINDOW_NAME, preview)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")) or cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
@@ -121,6 +154,11 @@ def run_camera(camera_index, detector, user_id, reference, model, captures_root=
                     key = 32
             if key in (ord("d"), ord("D")):
                 show_details = not show_details
+            if key in (ord("m"), ord("M")):
+                mirror = not mirror
+            if key in (ord("f"), ord("F")):
+                focus_enabled = not focus_enabled
+                focus_view.reset()
             if key in (32, ord("s"), ord("S"), ord("t"), ord("T")):
                 feedback_until_ns = now + 2_000_000_000
             if key in (ord("s"), ord("S")) and scores is not None:
@@ -145,6 +183,7 @@ def run_camera(camera_index, detector, user_id, reference, model, captures_root=
                 if session.count == samples:
                     path = session.finalize()
                     model = load_model(path)
+                    matcher = PreparedMatcher(model)
                     phase = "remove_hand"
                     print(f"Palm profile saved at {path}", flush=True)
             elif actual is None:

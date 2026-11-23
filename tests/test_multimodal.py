@@ -6,6 +6,7 @@ import math
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -13,6 +14,7 @@ from evaluate import split_samples
 from geometry import RATIO_COLUMNS
 from multimodal import PreparedMatcher, build_personal_model, load_model, load_reference, score_probe, validate_reference
 from palmprint import DEFAULT_QUALITY, DESCRIPTOR_VERSION, PALM_FEATURE_SIZE
+from palm_learning import fit_metric, validate_metric
 from prepare_palm import _calibration_scale, evaluate_records, pairwise_distances
 
 
@@ -209,6 +211,30 @@ class MultimodalTests(unittest.TestCase):
         self.assertEqual(matcher.score_all([1.1] * 5, dense), before)
         with self.assertRaises(ValueError):
             matcher.score_probe([1] * 5, dense, "unknown")
+
+    def test_prepared_learned_metric_matches_standalone_without_revalidation_per_probe(self):
+        model = self.model()
+        descriptors = [palm(1, 0), palm(0.8, 0.6), palm(0, 1), palm(0.6, 0.8)]
+        model["palm_metric"] = fit_metric(descriptors, ["alice", "alice", "bob", "bob"])
+        model["templates"]["bob"] = {"geometry": [1.5] * 5, "palm": palm(0, 1)}
+        probes = (
+            ([1.1] * 5, palm(0.8, 0.6), "ok", "ok"),
+            (None, palm(1, 0), "finger_out_of_frame", "ok"),
+            ([1] * 5, None, "ok", "palm_too_small"),
+        )
+        expected = [
+            {claim: score_probe(geometry, descriptor, claim, model, geometry_status, palm_status)
+             for claim in model["templates"]}
+            for geometry, descriptor, geometry_status, palm_status in probes
+        ]
+        with patch("multimodal.validate_metric", wraps=validate_metric) as validate:
+            matcher = PreparedMatcher(model)
+            self.assertEqual(validate.call_count, 1)
+        with patch("palm_learning._metric_arrays", side_effect=AssertionError("metric arrays were revalidated per probe")):
+            for (geometry, descriptor, geometry_status, palm_status), expected_row in zip(probes, expected, strict=True):
+                self.assertEqual(matcher.score_all(geometry, descriptor, geometry_status, palm_status), expected_row)
+                for claim in model["templates"]:
+                    self.assertEqual(matcher.score_probe(geometry, descriptor, claim, geometry_status, palm_status), expected_row[claim])
 
 
 if __name__ == "__main__":
